@@ -36,6 +36,36 @@
 
 ---
 
+## [2026-04-16 12:50] Bot bootstrap MVP
+### Current state
+- Реализован минимальный рабочий `aiogram` bootstrap для Telegram-бота.
+- Команды `/start` и `/help` отвечают короткими сообщениями.
+- Добавлена reply keyboard с кнопками `Help` и `Link account`.
+- `BOT_TOKEN` читается из `.env` через `pydantic-settings` и валидируется при старте.
+- `scripts/run_bot.py` запускает бота одной командой.
+
+### Decisions made
+- Не трогать архитектуру MVP и не добавлять Telethon, БД, webhook, scheduler или Docker.
+- Свести bot layer к одному роутеру и одному handler-модулю для минимального старта.
+- Считать отсутствие или пустоту `BOT_TOKEN` фатальной ошибкой конфигурации.
+
+### Problems / blockers
+- В этой среде нет сетевого доступа к Telegram API, поэтому полноценный polling smoke-test невозможен.
+- Локальная проверка ограничена синтаксической компиляцией и импортами из `.venv`.
+
+### Files changed
+- `app/config.py`
+- `app/bot/main.py`
+- `app/bot/handlers/start.py`
+- `app/bot/handlers/__init__.py`
+- `scripts/run_bot.py`
+
+### Next step
+- Подключить следующий минимальный slice из execution plan после этого bot bootstrap.
+
+### Prompt handoff
+Минимальный bot bootstrap уже есть. Следующий агент должен продолжать по execution_plan.md, не ломая текущую структуру: не добавлять Telethon/DB/webhook, а двигаться к следующему маленькому рабочему шагу MVP.
+
 ## [2026-04-15 00:00] Project initialization
 ### Current state
 - Сформулирована идея MVP: Telegram-бот и web UI для персональных дайджестов по открытым Telegram-каналам.
@@ -57,23 +87,23 @@
 - Нужно быстро собрать repo skeleton и начать реализацию P0.
 
 ### Files changed
-- product_scope.md
-- architecture.md
-- execution_plan.md
-- Evolution.md
+- `product_scope.md`
+- `architecture.md`
+- `execution_plan.md`
+- `Evolution.md`
 
 ### Next step
 - Создать repo skeleton и базовую структуру модулей `web`, `api`, `bot`, `docs`.
 
 ### Prompt handoff
-Нужно продолжить проект AI Digest Assistant. Уже есть 4 markdown-файла с scope, architecture, execution plan и evolution log. Следующий шаг - создать repo skeleton для modular monolith: web, api, bot, docs, базовые env-файлы, README и стартовую структуру backend/frontend. Важно не расширять scope beyond MVP и не уходить в overengineering.
+Нужно продолжить проект AI Digest Assistant. Уже есть 4 markdown-файла со scope, architecture, execution plan и evolution log. Следующий шаг - создать repo skeleton для modular monolith: web, api, bot, docs, базовые env-файлы, README и стартовую структуру backend/frontend. Важно не расширять scope beyond MVP и не уходить в overengineering.
 
 ## 2026-04-15
 
 ### Done
 - создан skeleton проекта
 - настроен git и GitHub
-- создан .venv
+- создан `.venv`
 - FastAPI health endpoint запускается
 
 ### Decisions
@@ -88,6 +118,6 @@
 - git remote history conflict решен force push
 
 ### Next
-- заполнить .env
-- привести config.py к рабочему baseline
-- поднять bot /start
+- заполнить `.env`
+- привести `config.py` к рабочему baseline
+- поднять bot `/start`

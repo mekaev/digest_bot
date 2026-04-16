@@ -1,7 +1,7 @@
 ﻿from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     )
 
     # Telegram bot
-    bot_token: str = Field(default="", alias="BOT_TOKEN")
+    bot_token: str = Field(..., alias="BOT_TOKEN")
 
     # Telegram client for Telethon
     telegram_api_id: str = Field(default="", alias="TELEGRAM_API_ID")
@@ -49,4 +49,24 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    try:
+        settings = Settings()
+    except ValidationError as exc:
+        bot_token_locs = {("bot_token",), ("BOT_TOKEN",)}
+        missing_bot_token = any(
+            tuple(error.get("loc", ())) in bot_token_locs
+            and error.get("type") == "missing"
+            for error in exc.errors()
+        )
+        if missing_bot_token:
+            raise RuntimeError(
+                "Configuration error: BOT_TOKEN is missing. Set BOT_TOKEN in .env."
+            ) from exc
+        raise RuntimeError("Configuration error: invalid values in .env.") from exc
+
+    if not settings.bot_token.strip():
+        raise RuntimeError(
+            "Configuration error: BOT_TOKEN is empty. Set BOT_TOKEN in .env."
+        )
+
+    return settings
