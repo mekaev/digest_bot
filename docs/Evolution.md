@@ -67,3 +67,27 @@
 
 ### Prompt handoff
 Нужно продолжить проект AI Digest Assistant. Уже есть 4 markdown-файла с scope, architecture, execution plan и evolution log. Следующий шаг - создать repo skeleton для modular monolith: web, api, bot, docs, базовые env-файлы, README и стартовую структуру backend/frontend. Важно не расширять scope beyond MVP и не уходить в overengineering.
+
+## 2026-04-15
+
+### Done
+- создан skeleton проекта
+- настроен git и GitHub
+- создан .venv
+- FastAPI health endpoint запускается
+
+### Decisions
+- bot: aiogram
+- ingestion: Telethon
+- LLM: Together AI
+- DB: SQLite for MVP
+- deploy: VPS over SSH, no Docker for now
+
+### Issues
+- был конфликт import path для app
+- git remote history conflict решен force push
+
+### Next
+- заполнить .env
+- привести config.py к рабочему baseline
+- поднять bot /start
