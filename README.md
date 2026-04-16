@@ -1,4 +1,4 @@
-﻿# AI Telegram Digest Bot
+# AI Telegram Digest Bot
 
 MVP-skeleton for a Telegram bot that ingests channel messages, ranks/summarizes them, and exposes a small API layer.
 
