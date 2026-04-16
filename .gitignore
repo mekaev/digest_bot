@@ -23,6 +23,8 @@ venv/
 data/*.db
 data/*.sqlite
 data/*.sqlite3
+data/telethon_ingestion.session
+*.session
 
 *.pyc
 *.db
