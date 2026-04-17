@@ -641,6 +641,226 @@ class DigestPromptTests(SessionTestMixin, unittest.TestCase):
         self.assertGreaterEqual(len(digest_items), 2)
         self.assertEqual(digest_items[0].post_id, high_signal_post.id)
 
+    def test_ranking_uses_channel_relative_baseline(self) -> None:
+        session, _engine = self.make_session()
+        user = UserService(session).upsert_telegram_user(
+            telegram_user_id=705,
+            username="relativeuser",
+            display_name="Relative User",
+        )
+        large_channel = self.create_user_added_channel(session, user.id, "bigfeed", "Big Feed", enabled=True)
+        niche_channel = self.create_user_added_channel(session, user.id, "nichefeed", "Niche Feed", enabled=True)
+
+        now = datetime.now(timezone.utc)
+        for offset, views, reactions, forwards, comments in (
+            (10, 1900, 220, 50, 20),
+            (11, 2100, 240, 55, 22),
+            (12, 2200, 250, 58, 24),
+        ):
+            session.add(
+                Post(
+                    channel_id=large_channel.id,
+                    telegram_message_id=500 + offset,
+                    raw_text=f"Large baseline {offset}",
+                    cleaned_text=f"Large channel routine update {offset} about infrastructure rollout.",
+                    source_url=f"https://t.me/bigfeed/{500 + offset}",
+                    views_count=views,
+                    reactions_count=reactions,
+                    forwards_count=forwards,
+                    comments_count=comments,
+                    published_at=now - timedelta(hours=offset),
+                )
+            )
+
+        large_candidate = Post(
+            channel_id=large_channel.id,
+            telegram_message_id=599,
+            raw_text="Large channel candidate",
+            cleaned_text="Large channel product note about a routine model refresh and rollout plan.",
+            source_url="https://t.me/bigfeed/599",
+            views_count=2300,
+            reactions_count=260,
+            forwards_count=60,
+            comments_count=25,
+            published_at=now - timedelta(hours=1),
+        )
+        niche_candidate = Post(
+            channel_id=niche_channel.id,
+            telegram_message_id=699,
+            raw_text="Niche channel breakout",
+            cleaned_text="Small channel exclusive: startup ships an open source agent runner with browser automation and local eval tooling.",
+            source_url="https://t.me/nichefeed/699",
+            views_count=420,
+            reactions_count=48,
+            forwards_count=12,
+            comments_count=6,
+            published_at=now - timedelta(hours=2),
+        )
+        for offset, views, reactions, forwards, comments in (
+            (14, 70, 7, 1, 0),
+            (15, 60, 5, 1, 0),
+            (16, 50, 4, 0, 0),
+        ):
+            session.add(
+                Post(
+                    channel_id=niche_channel.id,
+                    telegram_message_id=600 + offset,
+                    raw_text=f"Niche baseline {offset}",
+                    cleaned_text=f"Niche channel regular update {offset} about community links.",
+                    source_url=f"https://t.me/nichefeed/{600 + offset}",
+                    views_count=views,
+                    reactions_count=reactions,
+                    forwards_count=forwards,
+                    comments_count=comments,
+                    published_at=now - timedelta(hours=offset),
+                )
+            )
+
+        session.add(large_candidate)
+        session.add(niche_candidate)
+        session.commit()
+
+        result = DigestService(session, llm=DummyLLM()).generate_digest_for_user(user.id, max_items=2)
+        digest_items = list(session.scalars(select(DigestItem).order_by(DigestItem.id.asc())))
+
+        self.assertTrue(result.has_content)
+        self.assertEqual(len(digest_items), 2)
+        self.assertEqual(digest_items[0].post_id, niche_candidate.id)
+
+    def test_digest_deduplicates_same_news_across_channels(self) -> None:
+        session, _engine = self.make_session()
+        user = UserService(session).upsert_telegram_user(
+            telegram_user_id=706,
+            username="dedupeuser",
+            display_name="Dedupe User",
+        )
+        first_channel = self.create_user_added_channel(session, user.id, "alphafeed", "Alpha Feed", enabled=True)
+        second_channel = self.create_user_added_channel(session, user.id, "betafeed", "Beta Feed", enabled=True)
+        third_channel = self.create_user_added_channel(session, user.id, "gammafeed", "Gamma Feed", enabled=True)
+
+        now = datetime.now(timezone.utc)
+        session.add(
+            Post(
+                channel_id=first_channel.id,
+                telegram_message_id=801,
+                raw_text="Rosalind release",
+                cleaned_text=(
+                    "OpenAI released GPT Rosalind for biology and chemistry research, aiming to speed up drug discovery workflows."
+                ),
+                source_url="https://t.me/alphafeed/801",
+                views_count=900,
+                reactions_count=90,
+                forwards_count=20,
+                comments_count=8,
+                published_at=now - timedelta(hours=1),
+            )
+        )
+        session.add(
+            Post(
+                channel_id=second_channel.id,
+                telegram_message_id=802,
+                raw_text="Rosalind copy",
+                cleaned_text=(
+                    "GPT Rosalind from OpenAI targets biology and chemistry research and helps drug discovery teams move faster."
+                ),
+                source_url="https://t.me/betafeed/802",
+                views_count=850,
+                reactions_count=88,
+                forwards_count=19,
+                comments_count=7,
+                published_at=now - timedelta(hours=2),
+            )
+        )
+        session.add(
+            Post(
+                channel_id=third_channel.id,
+                telegram_message_id=803,
+                raw_text="Distinct topic",
+                cleaned_text=(
+                    "Anthropic added a new API budget control mode so teams can cap token usage per task and per run."
+                ),
+                source_url="https://t.me/gammafeed/803",
+                views_count=700,
+                reactions_count=75,
+                forwards_count=18,
+                comments_count=5,
+                published_at=now - timedelta(hours=3),
+            )
+        )
+        session.commit()
+
+        result = DigestService(session, llm=DummyLLM()).generate_digest_for_user(user.id)
+
+        self.assertTrue(result.has_content)
+        self.assertEqual(result.digest.source_post_count, 2)
+        duplicate_urls = {
+            "https://t.me/alphafeed/801",
+            "https://t.me/betafeed/802",
+        }
+        present_duplicate_urls = {url for url in duplicate_urls if url in result.message_text}
+        self.assertEqual(len(present_duplicate_urls), 1)
+        self.assertIn("https://t.me/gammafeed/803", result.message_text)
+
+    def test_digest_selection_promotes_channel_diversity(self) -> None:
+        session, _engine = self.make_session()
+        user = UserService(session).upsert_telegram_user(
+            telegram_user_id=707,
+            username="diversityuser",
+            display_name="Diversity User",
+        )
+        dominant_channel = self.create_user_added_channel(session, user.id, "dominantfeed", "Dominant Feed", enabled=True)
+        secondary_channel = self.create_user_added_channel(session, user.id, "secondaryfeed", "Secondary Feed", enabled=True)
+
+        now = datetime.now(timezone.utc)
+        session.add_all(
+            [
+                Post(
+                    channel_id=dominant_channel.id,
+                    telegram_message_id=901,
+                    raw_text="Dominant 1",
+                    cleaned_text="Dominant channel ships a new coding agent benchmark and publishes the evaluation harness.",
+                    source_url="https://t.me/dominantfeed/901",
+                    views_count=1400,
+                    reactions_count=140,
+                    forwards_count=35,
+                    comments_count=9,
+                    published_at=now - timedelta(hours=1),
+                ),
+                Post(
+                    channel_id=dominant_channel.id,
+                    telegram_message_id=902,
+                    raw_text="Dominant 2",
+                    cleaned_text="Dominant channel also launches a separate observability release for production agent tracing.",
+                    source_url="https://t.me/dominantfeed/902",
+                    views_count=1300,
+                    reactions_count=120,
+                    forwards_count=30,
+                    comments_count=8,
+                    published_at=now - timedelta(hours=2),
+                ),
+                Post(
+                    channel_id=secondary_channel.id,
+                    telegram_message_id=903,
+                    raw_text="Secondary",
+                    cleaned_text="Secondary channel shares a practical guide for evaluating browser agents on real support workflows.",
+                    source_url="https://t.me/secondaryfeed/903",
+                    views_count=500,
+                    reactions_count=45,
+                    forwards_count=10,
+                    comments_count=4,
+                    published_at=now - timedelta(hours=3),
+                ),
+            ]
+        )
+        session.commit()
+
+        result = DigestService(session, llm=DummyLLM()).generate_digest_for_user(user.id, max_items=2)
+        digest_items = list(session.scalars(select(DigestItem).order_by(DigestItem.id.asc())))
+
+        self.assertTrue(result.has_content)
+        self.assertEqual(len(digest_items), 2)
+        self.assertEqual({item.channel_title for item in digest_items}, {"Dominant Feed", "Secondary Feed"})
+
     def test_top_n_truncation_works(self) -> None:
         session, _engine = self.make_session()
         user = UserService(session).upsert_telegram_user(

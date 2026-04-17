@@ -2,6 +2,36 @@
 
 ---
 
+## [2026-04-17 13:35] Digest ranking normalization + topic dedup cleanup
+### Current state
+- Digest ranking no longer relies only on absolute engagement numbers across all channels.
+- Candidate posts are now scored against a per-channel baseline inside the selected digest window.
+- Digest selection now removes repeated coverage of the same news topic across channels before top-N truncation.
+- Digest selection also does a first-pass channel diversity sweep so one source does not crowd out all others when multiple channels have relevant posts.
+
+### Decisions made
+- Kept the existing ingest and persistence model; no schema or architecture rewrite was introduced for this cleanup.
+- Used simple explainable heuristics instead of embeddings or RAG: channel-relative engagement, token-based topic similarity, and two-pass item selection.
+- Left the existing Russian-only digest prompt/fallback path in place and fixed the main quality issue in ranking/selection instead of adding a bigger generation subsystem.
+
+### Problems / blockers
+- Topic dedup is still heuristic and lexical, so it will not catch every semantic duplicate and may need later tuning on real user data.
+- There is still no source-of-truth "original post" signal, so when several channels cover the same news the winner is the best-ranked representative, not guaranteed the earliest source.
+
+### Files changed
+- `app/digest/ranking.py`
+- `app/services/digest_service.py`
+- `tests/test_mvp_slice.py`
+- `docs/Evolution.md`
+
+### Next step
+- Tighten digest selection quality further with lightweight novelty/originality signals or better duplicate clustering if real traffic shows remaining repetition.
+
+### Prompt handoff
+The digest path now uses per-channel relative ranking, topic-level duplicate filtering across channels, and a simple diversity-first top-N selector. The next cleanup should stay narrow: tune ranking weights or duplicate detection from real examples instead of introducing RAG, a new frontend, or a rewritten architecture.
+
+---
+
 ## [2026-04-17 13:20] User-added-only bot flow + digest period and ranking
 ### Current state
 - Curated channels are removed from the visible bot UX and `/channels` now shows only user-added channels for the current user.

@@ -1,3 +1,4 @@
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import re
@@ -6,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models import Channel, Digest, DigestItem, Post, Subscription
-from app.digest.ranking import score_post_text
+from app.digest.ranking import ChannelMetricBaseline, extract_topic_tokens, score_post_text
 from app.services.llm import TogetherLLM
 from app.services.user_service import UserService
 
@@ -87,7 +88,7 @@ class DigestService:
                 has_content=False,
             )
 
-        selected_items: list[tuple[Post, float]] = ranked_posts[:max_items]
+        selected_items = self._select_digest_items(ranked_posts, max_items=max_items)
         digest = Digest(
             user_id=user_id,
             status="ready",
@@ -142,8 +143,9 @@ class DigestService:
             seen_texts.add(normalized_text)
             unique_posts.append(post)
 
+        baselines = self._build_channel_baselines(unique_posts)
         now = datetime.now(timezone.utc)
-        scored = []
+        scored: list[tuple[Post, float]] = []
         for post in unique_posts:
             published_at = _coerce_utc(post.published_at)
             age_hours = max((now - published_at).total_seconds() / 3600.0, 0.0)
@@ -154,11 +156,105 @@ class DigestService:
                 reactions=post.reactions_count,
                 forwards=post.forwards_count,
                 comments=post.comments_count,
+                baseline=baselines.get(post.channel_id),
             )
             scored.append((post, score))
 
         scored.sort(key=lambda item: (item[1], item[0].published_at), reverse=True)
-        return scored
+        return self._deduplicate_topics(scored)
+
+    def _select_digest_items(
+        self,
+        ranked_posts: list[tuple[Post, float]],
+        max_items: int,
+    ) -> list[tuple[Post, float]]:
+        if max_items <= 0:
+            return []
+
+        selected: list[tuple[Post, float]] = []
+        selected_post_ids: set[int] = set()
+        used_channels: set[int] = set()
+
+        for post, score in ranked_posts:
+            if post.channel_id in used_channels:
+                continue
+            selected.append((post, score))
+            selected_post_ids.add(post.id)
+            used_channels.add(post.channel_id)
+            if len(selected) >= max_items:
+                return selected
+
+        for post, score in ranked_posts:
+            if post.id in selected_post_ids:
+                continue
+            selected.append((post, score))
+            if len(selected) >= max_items:
+                break
+
+        return selected
+
+    def _build_channel_baselines(self, posts: list[Post]) -> dict[int, ChannelMetricBaseline]:
+        grouped_posts: dict[int, list[Post]] = defaultdict(list)
+        for post in posts:
+            grouped_posts[post.channel_id].append(post)
+
+        baselines: dict[int, ChannelMetricBaseline] = {}
+        for channel_id, channel_posts in grouped_posts.items():
+            count = max(len(channel_posts), 1)
+            baselines[channel_id] = ChannelMetricBaseline(
+                avg_views=sum(max(post.views_count or 0, 0) for post in channel_posts) / count,
+                avg_reactions=sum(max(post.reactions_count or 0, 0) for post in channel_posts) / count,
+                avg_forwards=sum(max(post.forwards_count or 0, 0) for post in channel_posts) / count,
+                avg_comments=sum(max(post.comments_count or 0, 0) for post in channel_posts) / count,
+            )
+        return baselines
+
+    def _deduplicate_topics(self, scored_posts: list[tuple[Post, float]]) -> list[tuple[Post, float]]:
+        token_sets: dict[int, set[str]] = {
+            post.id: set(extract_topic_tokens(post.cleaned_text))
+            for post, _score in scored_posts
+        }
+        token_frequencies: dict[str, int] = defaultdict(int)
+        for token_set in token_sets.values():
+            for token in token_set:
+                token_frequencies[token] += 1
+
+        unique_topics: list[tuple[Post, float]] = []
+        for post, score in scored_posts:
+            if any(
+                self._posts_share_topic(post, existing_post, token_sets, token_frequencies)
+                for existing_post, _ in unique_topics
+            ):
+                continue
+            unique_topics.append((post, score))
+        return unique_topics
+
+    def _posts_share_topic(
+        self,
+        left_post: Post,
+        right_post: Post,
+        token_sets: dict[int, set[str]],
+        token_frequencies: dict[str, int],
+    ) -> bool:
+        left_tokens = token_sets.get(left_post.id, set())
+        right_tokens = token_sets.get(right_post.id, set())
+        if not left_tokens or not right_tokens:
+            return False
+
+        shared_tokens = left_tokens & right_tokens
+        distinctive_shared_tokens = {
+            token for token in shared_tokens if token_frequencies.get(token, 0) <= 2
+        }
+        if len(distinctive_shared_tokens) < 2:
+            return False
+
+        shared_weight = sum(1.0 / token_frequencies[token] for token in distinctive_shared_tokens)
+        left_weight = sum(1.0 / token_frequencies[token] for token in left_tokens)
+        right_weight = sum(1.0 / token_frequencies[token] for token in right_tokens)
+        reference_weight = min(left_weight, right_weight)
+        if reference_weight <= 0.0:
+            return False
+        return shared_weight / reference_weight >= 0.5
 
     def _build_digest_text(
         self,
