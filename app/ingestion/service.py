@@ -25,15 +25,17 @@ class IngestionService:
         user_id: int,
         limit: int = 20,
         allow_login: bool = False,
+        user_added_only: bool = False,
     ) -> list[IngestionRun]:
-        channels = list(
-            self.session.scalars(
-                select(Channel)
-                .join(Subscription, Subscription.channel_id == Channel.id)
-                .where(Subscription.user_id == user_id, Subscription.enabled.is_(True))
-                .order_by(Channel.title.asc())
-            )
+        statement = (
+            select(Channel)
+            .join(Subscription, Subscription.channel_id == Channel.id)
+            .where(Subscription.user_id == user_id, Subscription.enabled.is_(True))
+            .order_by(Channel.title.asc())
         )
+        if user_added_only:
+            statement = statement.where(Channel.is_user_added.is_(True))
+        channels = list(self.session.scalars(statement))
         return await self.ingest_channels(channels, limit=limit, allow_login=allow_login)
 
     async def ingest_channels(
@@ -98,6 +100,10 @@ class IngestionService:
                 raw_text=message.raw_text,
                 cleaned_text=cleaned_text,
                 source_url=message.source_url,
+                views_count=message.views_count,
+                reactions_count=message.reactions_count,
+                forwards_count=message.forwards_count,
+                comments_count=message.comments_count,
                 published_at=message.published_at,
             )
             self.session.add(post)

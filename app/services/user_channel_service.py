@@ -116,6 +116,35 @@ class UserChannelService:
             for channel, subscription in rows
         ]
 
+    def toggle_user_channel(self, user_id: int, channel_id: int) -> Subscription:
+        self._require_user(user_id)
+        channel = self.session.get(Channel, channel_id)
+        if channel is None:
+            raise ValueError(f"Unknown channel_id: {channel_id}")
+        if not channel.is_user_added:
+            raise ValueError("Only user-added channels can be managed in this flow.")
+
+        subscription = self.session.scalar(
+            select(Subscription).where(
+                Subscription.user_id == user_id,
+                Subscription.channel_id == channel_id,
+            )
+        )
+        if subscription is None:
+            subscription = Subscription(
+                user_id=user_id,
+                channel_id=channel_id,
+                enabled=True,
+                frequency="daily",
+            )
+            self.session.add(subscription)
+        else:
+            subscription.enabled = not subscription.enabled
+
+        self.session.commit()
+        self.session.refresh(subscription)
+        return subscription
+
     def remove_user_added_channel_for_user(self, user_id: int, channel_id: int) -> None:
         self._require_user(user_id)
         channel = self.session.get(Channel, channel_id)

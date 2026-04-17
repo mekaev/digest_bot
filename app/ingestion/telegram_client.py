@@ -34,6 +34,10 @@ class TelegramMessage:
     channel_handle: str
     published_at: datetime
     source_url: str
+    views_count: int = 0
+    reactions_count: int = 0
+    forwards_count: int = 0
+    comments_count: int = 0
 
     @property
     def message_id(self) -> int:
@@ -66,6 +70,10 @@ class TelegramIngestionClient:
             channel_handle=channel.lstrip("@"),
             published_at=published_at,
             source_url=self._build_source_url(channel, message_id),
+            views_count=_coerce_metric(payload.get("views")),
+            reactions_count=_coerce_metric(payload.get("reactions")),
+            forwards_count=_coerce_metric(payload.get("forwards")),
+            comments_count=_coerce_metric(payload.get("comments")),
         )
 
     async def validate_public_channel(
@@ -173,6 +181,10 @@ class TelegramIngestionClient:
                         channel_handle=normalized_handle,
                         published_at=published_at,
                         source_url=self._build_source_url(normalized_handle, message_id),
+                        views_count=_coerce_metric(getattr(message, "views", 0)),
+                        reactions_count=_extract_reactions_count(message),
+                        forwards_count=_coerce_metric(getattr(message, "forwards", 0)),
+                        comments_count=_extract_comments_count(message),
                     )
                 )
             return messages
@@ -209,3 +221,25 @@ def normalize_channel_reference(value: str) -> str:
 
 def _is_valid_public_handle(value: str) -> bool:
     return bool(re.fullmatch(r"[a-z][a-z0-9_]{3,31}", value))
+
+
+def _coerce_metric(value: Any) -> int:
+    try:
+        normalized = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(normalized, 0)
+
+
+def _extract_reactions_count(message: Any) -> int:
+    reactions = getattr(message, "reactions", None)
+    results = getattr(reactions, "results", None) or []
+    total = 0
+    for result in results:
+        total += _coerce_metric(getattr(result, "count", 0))
+    return total
+
+
+def _extract_comments_count(message: Any) -> int:
+    replies = getattr(message, "replies", None)
+    return _coerce_metric(getattr(replies, "replies", 0))

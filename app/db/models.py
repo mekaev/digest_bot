@@ -123,6 +123,7 @@ class DigestSchedule(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     frequency: Mapped[str] = mapped_column(String(32), default="daily", nullable=False)
+    window_days: Mapped[int] = mapped_column(Integer, default=7, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -146,6 +147,10 @@ class Post(Base):
     raw_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
     cleaned_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
     source_url: Mapped[str] = mapped_column(String(1000), default="", nullable=False)
+    views_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    reactions_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    forwards_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    comments_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

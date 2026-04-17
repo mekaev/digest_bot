@@ -10,7 +10,7 @@ from sqlalchemy.orm import sessionmaker
 
 os.environ.setdefault("BOT_TOKEN", "123456:TESTTOKEN")
 
-from app.bot.handlers.start import MAIN_KEYBOARD, _build_channels_view, _build_help_text
+from app.bot.handlers.start import MAIN_KEYBOARD, _build_channels_view, _build_help_text, _build_period_text
 from app.config import get_settings
 from app.db.base import Base
 from app.db.models import Channel, Digest, DigestItem, Post, Subscription, TelegramLinkCode, Topic
@@ -26,7 +26,11 @@ from app.services.catalog_service import CatalogService
 from app.services.digest_service import DEFAULT_DIGEST_MAX_ITEMS, DIGEST_SYSTEM_PROMPT, DigestService
 from app.services.subscription_service import SubscriptionService
 from app.services.user_channel_service import UserChannelService
-from app.services.user_service import UserService
+from app.services.user_service import (
+    ALLOWED_DIGEST_WINDOW_DAYS,
+    DEFAULT_DIGEST_WINDOW_DAYS,
+    UserService,
+)
 
 
 class DummyLLM:
@@ -79,6 +83,47 @@ class SessionTestMixin:
         self.addCleanup(session.close)
         return session, engine
 
+    def create_user_added_channel(
+        self,
+        session,
+        user_id: int,
+        telegram_handle: str,
+        title: str,
+        enabled: bool = True,
+    ) -> Channel:
+        topic = session.scalar(select(Topic).where(Topic.slug == "user-added"))
+        if topic is None:
+            topic = Topic(
+                slug="user-added",
+                name="User Added",
+                description="Hidden bucket",
+            )
+            session.add(topic)
+            session.flush()
+
+        channel = Channel(
+            topic_id=topic.id,
+            telegram_handle=telegram_handle,
+            title=title,
+            description="",
+            is_active=True,
+            is_user_added=True,
+            added_by_user_id=user_id,
+        )
+        session.add(channel)
+        session.flush()
+        session.add(
+            Subscription(
+                user_id=user_id,
+                channel_id=channel.id,
+                enabled=enabled,
+                frequency="daily",
+            )
+        )
+        session.commit()
+        session.refresh(channel)
+        return channel
+
 
 class FakeTelegramValidationClient:
     def __init__(
@@ -104,11 +149,10 @@ class FakeTelegramValidationClient:
 
 
 class MVPSliceTests(SessionTestMixin, unittest.TestCase):
-
     def test_schema_bootstrap_creates_core_tables(self) -> None:
         _session, engine = self.make_session()
         inspector = inspect(engine)
-        tables = set(inspector.get_table_names())
+        tables = set(inspect(engine).get_table_names())
         expected = {
             "users",
             "telegram_link_codes",
@@ -124,6 +168,12 @@ class MVPSliceTests(SessionTestMixin, unittest.TestCase):
         self.assertTrue(expected.issubset(tables))
         channel_columns = {column["name"] for column in inspector.get_columns("channels")}
         self.assertTrue({"is_user_added", "added_by_user_id"}.issubset(channel_columns))
+        schedule_columns = {column["name"] for column in inspector.get_columns("digest_schedules")}
+        self.assertIn("window_days", schedule_columns)
+        post_columns = {column["name"] for column in inspector.get_columns("posts")}
+        self.assertTrue(
+            {"views_count", "reactions_count", "forwards_count", "comments_count"}.issubset(post_columns)
+        )
 
     def test_link_code_is_reused_and_unknown_channel_is_rejected(self) -> None:
         session, _engine = self.make_session()
@@ -136,7 +186,7 @@ class MVPSliceTests(SessionTestMixin, unittest.TestCase):
         with self.assertRaises(ValueError):
             SubscriptionService(session).set_subscription(user.id, channel_id=999, enabled=True)
 
-    def test_catalog_toggle_and_store_messages_skip_empty_and_duplicates(self) -> None:
+    def test_catalog_toggle_and_store_messages_skip_empty_duplicates_and_keep_metrics(self) -> None:
         session, _engine = self.make_session()
         catalog_service = CatalogService(session)
         catalog_service.seed_catalog()
@@ -156,6 +206,10 @@ class MVPSliceTests(SessionTestMixin, unittest.TestCase):
                     channel_handle=channel.telegram_handle,
                     published_at=datetime.now(timezone.utc),
                     source_url="https://t.me/test/1",
+                    views_count=100,
+                    reactions_count=10,
+                    forwards_count=3,
+                    comments_count=2,
                 ),
                 TelegramMessage(
                     telegram_message_id=1,
@@ -179,14 +233,15 @@ class MVPSliceTests(SessionTestMixin, unittest.TestCase):
         posts = list(session.scalars(select(Post)))
         self.assertEqual(stored_count, 1)
         self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0].views_count, 100)
+        self.assertEqual(posts[0].reactions_count, 10)
+        self.assertEqual(posts[0].forwards_count, 3)
+        self.assertEqual(posts[0].comments_count, 2)
 
     def test_generate_digest_returns_empty_without_posts(self) -> None:
         session, _engine = self.make_session()
-        catalog_service = CatalogService(session)
-        catalog_service.seed_catalog()
         user = UserService(session).upsert_telegram_user(telegram_user_id=200, username="empty", display_name="Empty")
-        channel = catalog_service.list_channels()[0]
-        SubscriptionService(session).set_subscription(user.id, channel.id, enabled=True)
+        self.create_user_added_channel(session, user.id, "emptyfeed", "Empty Feed", enabled=True)
 
         result = DigestService(session, llm=DummyLLM()).generate_digest_for_user(user.id)
 
@@ -195,11 +250,8 @@ class MVPSliceTests(SessionTestMixin, unittest.TestCase):
 
     def test_generate_digest_creates_digest_and_items(self) -> None:
         session, _engine = self.make_session()
-        catalog_service = CatalogService(session)
-        catalog_service.seed_catalog()
         user = UserService(session).upsert_telegram_user(telegram_user_id=300, username="digest", display_name="Digest User")
-        channel = catalog_service.list_channels()[0]
-        SubscriptionService(session).set_subscription(user.id, channel.id, enabled=True)
+        channel = self.create_user_added_channel(session, user.id, "digestfeed", "Digest Feed", enabled=True)
 
         now = datetime.now(timezone.utc)
         session.add(
@@ -225,7 +277,7 @@ class MVPSliceTests(SessionTestMixin, unittest.TestCase):
         session.commit()
 
         result = DigestService(session, llm=DummyLLM()).generate_digest_for_user(user.id)
-        digest_items = list(session.scalars(select(DigestItem)))
+        digest_items = list(session.scalars(select(DigestItem).order_by(DigestItem.id.asc())))
 
         self.assertTrue(result.has_content)
         self.assertIsNotNone(result.digest)
@@ -359,7 +411,7 @@ class UserAddedChannelTests(SessionTestMixin, unittest.IsolatedAsyncioTestCase):
 
 
 class BotUXTests(SessionTestMixin, unittest.TestCase):
-    def test_channels_view_shows_curated_and_user_added_sections(self) -> None:
+    def test_channels_view_shows_only_user_added_channels(self) -> None:
         session, _engine = self.make_session()
         catalog_service = CatalogService(session)
         catalog_service.seed_catalog()
@@ -370,37 +422,15 @@ class BotUXTests(SessionTestMixin, unittest.TestCase):
         )
         curated_channel = catalog_service.list_channels()[0]
         SubscriptionService(session).set_subscription(user.id, curated_channel.id, enabled=True)
+        self.create_user_added_channel(session, user.id, "mynewsfeed", "My News Feed", enabled=False)
 
-        user_topic = Topic(
-            slug="user-added",
-            name="User Added",
-            description="Hidden bucket",
-        )
-        session.add(user_topic)
-        session.flush()
-        user_channel = Channel(
-            topic_id=user_topic.id,
-            telegram_handle="mynewsfeed",
-            title="My News Feed",
-            description="",
-            is_active=True,
-            is_user_added=True,
-            added_by_user_id=user.id,
-        )
-        session.add(user_channel)
-        session.flush()
-        SubscriptionService(session).set_subscription(user.id, user_channel.id, enabled=False)
-
-        text, markup = _build_channels_view(session, user.id, topic_id=None)
+        text, markup = _build_channels_view(session, user.id)
         button_texts = [button.text for row in markup.inline_keyboard for button in row]
 
-        self.assertIn("Curated channels:", text)
         self.assertIn("Your channels:", text)
-        self.assertIn(f"- ON {curated_channel.title} (@{curated_channel.telegram_handle})", text)
         self.assertIn("- OFF My News Feed (@mynewsfeed)", text)
-        self.assertIn("Curated channels", button_texts)
-        self.assertIn("Your channels", button_texts)
-        self.assertIn(f"[ON] {curated_channel.title}", button_texts)
+        self.assertNotIn(curated_channel.title, text)
+        self.assertNotIn(curated_channel.title, " ".join(button_texts))
         self.assertIn("[OFF] My News Feed", button_texts)
         self.assertIn("Remove", button_texts)
 
@@ -411,54 +441,53 @@ class BotUXTests(SessionTestMixin, unittest.TestCase):
             username="toggleuser",
             display_name="Toggle User",
         )
-        user_topic = Topic(
-            slug="user-added",
-            name="User Added",
-            description="Hidden bucket",
-        )
-        session.add(user_topic)
-        session.flush()
-        user_channel = Channel(
-            topic_id=user_topic.id,
-            telegram_handle="signalnews",
-            title="Signal News",
-            description="",
-            is_active=True,
-            is_user_added=True,
-            added_by_user_id=user.id,
-        )
-        session.add(user_channel)
-        session.flush()
-        SubscriptionService(session).set_subscription(user.id, user_channel.id, enabled=True)
+        user_channel = self.create_user_added_channel(session, user.id, "signalnews", "Signal News", enabled=True)
 
-        SubscriptionService(session).toggle_subscription(user.id, user_channel.id)
-        text_after_toggle, _markup = _build_channels_view(session, user.id, topic_id=None)
+        UserChannelService(session).toggle_user_channel(user.id, user_channel.id)
+        text_after_toggle, _markup = _build_channels_view(session, user.id)
         self.assertIn("- OFF Signal News (@signalnews)", text_after_toggle)
 
         UserChannelService(session).remove_user_added_channel_for_user(user.id, user_channel.id)
-        text_after_remove, _markup = _build_channels_view(session, user.id, topic_id=None)
+        text_after_remove, _markup = _build_channels_view(session, user.id)
         self.assertNotIn("Signal News", text_after_remove)
         self.assertIn("Use /addchannel", text_after_remove)
 
-    def test_topics_are_hidden_from_help_and_main_keyboard(self) -> None:
+    def test_topics_are_hidden_and_period_is_visible_in_help_and_keyboard(self) -> None:
         keyboard_texts = [button.text for row in MAIN_KEYBOARD.keyboard for button in row]
 
         self.assertNotIn("Topics", keyboard_texts)
         self.assertNotIn("/topics", _build_help_text())
+        self.assertIn("Period", keyboard_texts)
+        self.assertIn("/period", _build_help_text())
+        self.assertNotIn("curated", _build_help_text().lower())
+
+    def test_period_choices_are_saved(self) -> None:
+        session, _engine = self.make_session()
+        user_service = UserService(session)
+        user = user_service.upsert_telegram_user(
+            telegram_user_id=603,
+            username="perioduser",
+            display_name="Period User",
+        )
+
+        self.assertEqual(user_service.get_digest_window_days(user.id), DEFAULT_DIGEST_WINDOW_DAYS)
+        for days in ALLOWED_DIGEST_WINDOW_DAYS:
+            with self.subTest(days=days):
+                schedule = user_service.set_digest_window_days(user.id, days)
+                self.assertEqual(schedule.window_days, days)
+                self.assertEqual(user_service.get_digest_window_days(user.id), days)
+                self.assertIn(str(days), _build_period_text(days))
 
 
 class DigestPromptTests(SessionTestMixin, unittest.TestCase):
     def test_digest_prompt_uses_russian_contract_and_top_n_limit(self) -> None:
         session, _engine = self.make_session()
-        catalog_service = CatalogService(session)
-        catalog_service.seed_catalog()
         user = UserService(session).upsert_telegram_user(
-            telegram_user_id=603,
+            telegram_user_id=700,
             username="digestprompt",
             display_name="Digest Prompt",
         )
-        channel = catalog_service.list_channels()[0]
-        SubscriptionService(session).set_subscription(user.id, channel.id, enabled=True)
+        channel = self.create_user_added_channel(session, user.id, "promptfeed", "Prompt Feed", enabled=True)
 
         now = datetime.now(timezone.utc)
         for message_id in range(1, DEFAULT_DIGEST_MAX_ITEMS + 3):
@@ -506,15 +535,12 @@ class DigestPromptTests(SessionTestMixin, unittest.TestCase):
 
     def test_digest_falls_back_when_llm_returns_cjk_text(self) -> None:
         session, _engine = self.make_session()
-        catalog_service = CatalogService(session)
-        catalog_service.seed_catalog()
         user = UserService(session).upsert_telegram_user(
-            telegram_user_id=604,
+            telegram_user_id=701,
             username="digestfallback",
             display_name="Digest Fallback",
         )
-        channel = catalog_service.list_channels()[0]
-        SubscriptionService(session).set_subscription(user.id, channel.id, enabled=True)
+        channel = self.create_user_added_channel(session, user.id, "fallbackfeed", "Fallback Feed", enabled=True)
         session.add(
             Post(
                 channel_id=channel.id,
@@ -532,6 +558,119 @@ class DigestPromptTests(SessionTestMixin, unittest.TestCase):
         self.assertIn("Краткий дайджест по вашим каналам:", result.message_text)
         self.assertNotIn("你好", result.message_text)
         self.assertIn("Source: https://t.me/test/91", result.message_text)
+
+    def test_digest_filters_posts_by_saved_window(self) -> None:
+        session, _engine = self.make_session()
+        user_service = UserService(session)
+        user = user_service.upsert_telegram_user(
+            telegram_user_id=702,
+            username="windowuser",
+            display_name="Window User",
+        )
+        user_service.set_digest_window_days(user.id, 1)
+        channel = self.create_user_added_channel(session, user.id, "windowfeed", "Window Feed", enabled=True)
+
+        now = datetime.now(timezone.utc)
+        session.add(
+            Post(
+                channel_id=channel.id,
+                telegram_message_id=201,
+                raw_text="Recent update",
+                cleaned_text="Recent update inside the selected window.",
+                source_url="https://t.me/test/201",
+                published_at=now - timedelta(hours=6),
+            )
+        )
+        session.add(
+            Post(
+                channel_id=channel.id,
+                telegram_message_id=202,
+                raw_text="Old update",
+                cleaned_text="Old update outside the selected window.",
+                source_url="https://t.me/test/202",
+                published_at=now - timedelta(days=4),
+            )
+        )
+        session.commit()
+
+        result = DigestService(session, llm=DummyLLM()).generate_digest_for_user(user.id)
+
+        self.assertTrue(result.has_content)
+        self.assertIn("https://t.me/test/201", result.message_text)
+        self.assertNotIn("https://t.me/test/202", result.message_text)
+        self.assertEqual(result.digest.source_post_count, 1)
+
+    def test_ranking_handles_missing_metrics_and_prefers_higher_signal_posts(self) -> None:
+        session, _engine = self.make_session()
+        user = UserService(session).upsert_telegram_user(
+            telegram_user_id=703,
+            username="rankuser",
+            display_name="Rank User",
+        )
+        channel = self.create_user_added_channel(session, user.id, "rankfeed", "Rank Feed", enabled=True)
+
+        now = datetime.now(timezone.utc)
+        low_signal_post = Post(
+            channel_id=channel.id,
+            telegram_message_id=301,
+            raw_text="Low signal",
+            cleaned_text="Low signal update with missing metrics.",
+            source_url="https://t.me/test/301",
+            published_at=now - timedelta(hours=2),
+        )
+        high_signal_post = Post(
+            channel_id=channel.id,
+            telegram_message_id=302,
+            raw_text="High signal",
+            cleaned_text="High signal update with strong engagement.",
+            source_url="https://t.me/test/302",
+            views_count=1200,
+            reactions_count=180,
+            forwards_count=45,
+            comments_count=30,
+            published_at=now - timedelta(hours=3),
+        )
+        session.add(low_signal_post)
+        session.add(high_signal_post)
+        session.commit()
+
+        result = DigestService(session, llm=DummyLLM()).generate_digest_for_user(user.id)
+        digest_items = list(session.scalars(select(DigestItem).order_by(DigestItem.id.asc())))
+
+        self.assertTrue(result.has_content)
+        self.assertGreaterEqual(len(digest_items), 2)
+        self.assertEqual(digest_items[0].post_id, high_signal_post.id)
+
+    def test_top_n_truncation_works(self) -> None:
+        session, _engine = self.make_session()
+        user = UserService(session).upsert_telegram_user(
+            telegram_user_id=704,
+            username="topnuser",
+            display_name="Top N User",
+        )
+        channel = self.create_user_added_channel(session, user.id, "topnfeed", "Top N Feed", enabled=True)
+
+        now = datetime.now(timezone.utc)
+        for message_id in range(1, DEFAULT_DIGEST_MAX_ITEMS + 4):
+            session.add(
+                Post(
+                    channel_id=channel.id,
+                    telegram_message_id=400 + message_id,
+                    raw_text=f"Post {message_id}",
+                    cleaned_text=f"Digest candidate {message_id} with enough text for ranking.",
+                    source_url=f"https://t.me/test/{400 + message_id}",
+                    views_count=message_id * 100,
+                    published_at=now - timedelta(hours=message_id),
+                )
+            )
+        session.commit()
+
+        result = DigestService(session, llm=DummyLLM()).generate_digest_for_user(user.id)
+        digest_items = list(session.scalars(select(DigestItem).order_by(DigestItem.id.asc())))
+
+        self.assertTrue(result.has_content)
+        self.assertEqual(result.digest.source_post_count, DEFAULT_DIGEST_MAX_ITEMS)
+        self.assertEqual(len(digest_items), DEFAULT_DIGEST_MAX_ITEMS)
 
 
 class WebSurfaceTests(unittest.TestCase):

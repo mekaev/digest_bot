@@ -53,17 +53,36 @@ def _sync_schema() -> None:
 
     inspector = inspect(engine)
     table_names = set(inspector.get_table_names())
-    if "channels" not in table_names:
-        return
-
-    channel_columns = {column["name"] for column in inspector.get_columns("channels")}
     statements: list[str] = []
-    if "is_user_added" not in channel_columns:
-        statements.append(
-            "ALTER TABLE channels ADD COLUMN is_user_added BOOLEAN NOT NULL DEFAULT FALSE"
-        )
-    if "added_by_user_id" not in channel_columns:
-        statements.append("ALTER TABLE channels ADD COLUMN added_by_user_id INTEGER")
+
+    if "channels" in table_names:
+        channel_columns = {column["name"] for column in inspector.get_columns("channels")}
+        if "is_user_added" not in channel_columns:
+            statements.append(
+                "ALTER TABLE channels ADD COLUMN is_user_added BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+        if "added_by_user_id" not in channel_columns:
+            statements.append("ALTER TABLE channels ADD COLUMN added_by_user_id INTEGER")
+
+    if "digest_schedules" in table_names:
+        schedule_columns = {column["name"] for column in inspector.get_columns("digest_schedules")}
+        if "window_days" not in schedule_columns:
+            statements.append(
+                "ALTER TABLE digest_schedules ADD COLUMN window_days INTEGER NOT NULL DEFAULT 7"
+            )
+
+    if "posts" in table_names:
+        post_columns = {column["name"] for column in inspector.get_columns("posts")}
+        for column_name in (
+            "views_count",
+            "reactions_count",
+            "forwards_count",
+            "comments_count",
+        ):
+            if column_name not in post_columns:
+                statements.append(
+                    f"ALTER TABLE posts ADD COLUMN {column_name} INTEGER NOT NULL DEFAULT 0"
+                )
 
     if not statements:
         return

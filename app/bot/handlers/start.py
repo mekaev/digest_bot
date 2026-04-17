@@ -14,17 +14,16 @@ from aiogram.types import (
 from app.db.session import SessionLocal
 from app.ingestion.telegram_client import ChannelValidationError, IngestionConfigurationError
 from app.ingestion.service import IngestionService
-from app.services.catalog_service import CatalogService
 from app.services.digest_service import DigestService
-from app.services.subscription_service import SubscriptionService
 from app.services.user_channel_service import AddChannelResult, UserChannelService
-from app.services.user_service import UserService
+from app.services.user_service import ALLOWED_DIGEST_WINDOW_DAYS, UserService
 
 router = Router()
 
 
 class AddChannelState(StatesGroup):
     waiting_for_channel = State()
+
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
@@ -36,7 +35,10 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
             KeyboardButton(text="Channels"),
             KeyboardButton(text="Add channel"),
         ],
-        [KeyboardButton(text="Digest")],
+        [
+            KeyboardButton(text="Period"),
+            KeyboardButton(text="Digest"),
+        ],
     ],
     resize_keyboard=True,
 )
@@ -53,9 +55,10 @@ async def start_handler(message: Message) -> None:
             username=message.from_user.username or "",
             display_name=message.from_user.full_name,
         )
-        subscriptions = SubscriptionService(session).list_subscribed_channels(user.id)
+        channel_entries = UserChannelService(session).list_user_added_channels(user.id)
+        has_enabled_channels = any(entry.subscription.enabled for entry in channel_entries)
 
-    next_step = "/channels" if not subscriptions else "/digest"
+    next_step = "/addchannel" if not has_enabled_channels else "/digest"
     await message.answer(
         "AI Telegram Digest Bot is ready.\n"
         f"Your account is saved. Next step: use {next_step}.",
@@ -93,12 +96,9 @@ async def link_handler(message: Message) -> None:
 
 @router.message(Command("topics"))
 async def topics_handler(message: Message) -> None:
-    with SessionLocal() as session:
-        topics = CatalogService(session).list_topics()
-
     await message.answer(
-        "Curated topics:",
-        reply_markup=_build_topics_keyboard(topics),
+        "Topics are disabled in the current MVP. Use /channels, /addchannel, and /period.",
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
@@ -113,9 +113,28 @@ async def channels_handler(message: Message) -> None:
             username=message.from_user.username or "",
             display_name=message.from_user.full_name,
         )
-        text, markup = _build_channels_view(session, user.id, topic_id=None)
+        text, markup = _build_channels_view(session, user.id)
 
     await message.answer(text, reply_markup=markup)
+
+
+@router.message(Command("period"))
+async def period_handler(message: Message) -> None:
+    if message.from_user is None:
+        return
+
+    with SessionLocal() as session:
+        user = UserService(session).upsert_telegram_user(
+            telegram_user_id=message.from_user.id,
+            username=message.from_user.username or "",
+            display_name=message.from_user.full_name,
+        )
+        window_days = UserService(session).get_digest_window_days(user.id)
+
+    await message.answer(
+        _build_period_text(window_days),
+        reply_markup=_build_period_keyboard(window_days),
+    )
 
 
 @router.message(Command("addchannel"))
@@ -147,18 +166,23 @@ async def digest_handler(message: Message) -> None:
                 display_name=message.from_user.full_name,
             )
 
+        window_days = user_service.get_digest_window_days(user.id)
         ingestion_runs = await IngestionService(session).ingest_user_subscriptions(
             user.id,
             limit=20,
             allow_login=False,
+            user_added_only=True,
         )
         result = DigestService(session).generate_digest_for_user(user.id)
         if result.digest is not None:
             DigestService(session).mark_delivered(result.digest.id)
 
     failure_note = _build_ingestion_note(ingestion_runs)
-    message_text = result.message_text if not failure_note else f"{result.message_text}\n\n{failure_note}"
-    await message.answer(message_text, reply_markup=MAIN_KEYBOARD)
+    period_note = f"Digest window: {window_days} day(s)."
+    message_text = result.message_text
+    if failure_note:
+        message_text = f"{message_text}\n\n{failure_note}"
+    await message.answer(f"{period_note}\n\n{message_text}", reply_markup=MAIN_KEYBOARD)
 
 
 @router.message(AddChannelState.waiting_for_channel)
@@ -188,6 +212,31 @@ async def add_channel_input_handler(message: Message, state: FSMContext) -> None
         await _handle_add_channel_submission(message, state, channel_reference)
         return
 
+    if message.text == "Period" or message.text.startswith("/period"):
+        await state.clear()
+        await period_handler(message)
+        return
+
+    if message.text == "Channels" or message.text.startswith("/channels"):
+        await state.clear()
+        await channels_handler(message)
+        return
+
+    if message.text == "Help" or message.text.startswith("/help"):
+        await state.clear()
+        await help_handler(message)
+        return
+
+    if message.text == "Link account" or message.text.startswith("/link"):
+        await state.clear()
+        await link_handler(message)
+        return
+
+    if message.text == "Digest" or message.text.startswith("/digest"):
+        await state.clear()
+        await digest_handler(message)
+        return
+
     if message.text.startswith("/"):
         await state.clear()
         await message.answer(
@@ -196,57 +245,17 @@ async def add_channel_input_handler(message: Message, state: FSMContext) -> None
         )
         return
 
-    if message.text in {"Help", "Link account", "Channels", "Digest"}:
-        await state.clear()
-        if message.text == "Help":
-            await help_handler(message)
-        elif message.text == "Link account":
-            await link_handler(message)
-        elif message.text == "Channels":
-            await channels_handler(message)
-        else:
-            await digest_handler(message)
-        return
-
     await _handle_add_channel_submission(message, state, message.text)
-
-
-@router.callback_query(F.data == "noop")
-async def noop_callback(callback: CallbackQuery) -> None:
-    await callback.answer()
 
 
 @router.callback_query(F.data == "show-topics")
 async def show_topics_callback(callback: CallbackQuery) -> None:
-    if callback.message is None:
-        return
-
-    with SessionLocal() as session:
-        topics = CatalogService(session).list_topics()
-
-    await callback.message.edit_text(
-        "Curated topics:",
-        reply_markup=_build_topics_keyboard(topics),
-    )
-    await callback.answer()
+    await callback.answer("Topics are disabled in the current MVP.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("show-topic:"))
 async def show_topic_channels_callback(callback: CallbackQuery) -> None:
-    if callback.message is None or callback.from_user is None:
-        return
-
-    topic_id = int(callback.data.split(":")[1])
-    with SessionLocal() as session:
-        user = UserService(session).upsert_telegram_user(
-            telegram_user_id=callback.from_user.id,
-            username=callback.from_user.username or "",
-            display_name=callback.from_user.full_name,
-        )
-        text, markup = _build_channels_view(session, user.id, topic_id=topic_id)
-
-    await callback.message.edit_text(text, reply_markup=markup)
-    await callback.answer()
+    await callback.answer("Topics are disabled in the current MVP.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("toggle-sub:"))
@@ -255,10 +264,10 @@ async def toggle_subscription_callback(callback: CallbackQuery) -> None:
         return
 
     payload = callback.data.split(":")
-    _, channel_id_raw, *topic_payload = payload
-    channel_id = int(channel_id_raw)
-    topic_id_raw = topic_payload[0] if topic_payload else "0"
-    topic_id = None if topic_id_raw == "0" else int(topic_id_raw)
+    if len(payload) < 2:
+        await callback.answer("Unknown channel action.", show_alert=True)
+        return
+    channel_id = int(payload[1])
 
     with SessionLocal() as session:
         user = UserService(session).upsert_telegram_user(
@@ -266,12 +275,16 @@ async def toggle_subscription_callback(callback: CallbackQuery) -> None:
             username=callback.from_user.username or "",
             display_name=callback.from_user.full_name,
         )
-        subscription = SubscriptionService(session).toggle_subscription(user.id, channel_id)
-        text, markup = _build_channels_view(session, user.id, topic_id=topic_id)
+        try:
+            subscription = UserChannelService(session).toggle_user_channel(user.id, channel_id)
+        except ValueError as exc:
+            await callback.answer(str(exc), show_alert=True)
+            return
+        text, markup = _build_channels_view(session, user.id)
 
     state_text = "enabled" if subscription.enabled else "disabled"
     await callback.message.edit_text(text, reply_markup=markup)
-    await callback.answer(f"Subscription {state_text}.")
+    await callback.answer(f"Channel {state_text}.")
 
 
 @router.callback_query(F.data.startswith("remove-user-channel:"))
@@ -293,10 +306,39 @@ async def remove_user_channel_callback(callback: CallbackQuery) -> None:
         except ValueError as exc:
             await callback.answer(str(exc), show_alert=True)
             return
-        text, markup = _build_channels_view(session, user.id, topic_id=None)
+        text, markup = _build_channels_view(session, user.id)
 
     await callback.message.edit_text(text, reply_markup=markup)
-    await callback.answer("Channel removed from your sources.")
+    await callback.answer("Channel removed from your list.")
+
+
+@router.callback_query(F.data.startswith("set-period:"))
+async def set_period_callback(callback: CallbackQuery) -> None:
+    if callback.message is None or callback.from_user is None:
+        return
+
+    _, raw_days = callback.data.split(":")
+    window_days = int(raw_days)
+
+    with SessionLocal() as session:
+        user_service = UserService(session)
+        user = user_service.upsert_telegram_user(
+            telegram_user_id=callback.from_user.id,
+            username=callback.from_user.username or "",
+            display_name=callback.from_user.full_name,
+        )
+        try:
+            user_service.set_digest_window_days(user.id, window_days)
+        except ValueError as exc:
+            await callback.answer(str(exc), show_alert=True)
+            return
+        current_days = user_service.get_digest_window_days(user.id)
+
+    await callback.message.edit_text(
+        _build_period_text(current_days),
+        reply_markup=_build_period_keyboard(current_days),
+    )
+    await callback.answer(f"Digest period set to {current_days} day(s).")
 
 
 @router.message(F.text == "Help")
@@ -323,86 +365,34 @@ async def add_channel_button_handler(message: Message, state: FSMContext) -> Non
     )
 
 
+@router.message(F.text == "Period")
+async def period_button_handler(message: Message) -> None:
+    await period_handler(message)
+
+
 @router.message(F.text == "Digest")
 async def digest_button_handler(message: Message) -> None:
     await digest_handler(message)
 
 
-def _build_topics_keyboard(topics: list) -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton(
-                text=topic.name,
-                callback_data=f"show-topic:{topic.id}",
-            )
-        ]
-        for topic in topics
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def _build_channels_view(session, user_id: int, topic_id: int | None) -> tuple[str, InlineKeyboardMarkup]:
-    if topic_id is not None:
-        return _build_topic_channels_view(session, user_id, topic_id)
-
-    return _build_main_channels_view(session, user_id)
-
-
-def _build_main_channels_view(session, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    catalog_service = CatalogService(session)
-    subscription_service = SubscriptionService(session)
-    user_channel_service = UserChannelService(session)
-
-    curated_channels = catalog_service.list_channels()
-    user_channels = user_channel_service.list_user_added_channels(user_id)
-    subscription_map = subscription_service.get_subscription_map(user_id)
-
-    lines = [
-        "Channels overview.",
-        "",
-        "Curated channels:",
-    ]
-    for channel in curated_channels:
-        subscription = subscription_map.get(channel.id)
-        status = _format_enabled_state(bool(subscription and subscription.enabled))
-        lines.append(f"- {status} {channel.title} (@{channel.telegram_handle})")
-
-    lines.extend(
-        [
-            "",
-            "Your channels:",
-        ]
-    )
-    if not user_channels:
-        lines.append("- None yet. Use /addchannel to add a public source.")
-    else:
-        for entry in user_channels:
-            status = _format_enabled_state(entry.subscription.enabled)
-            lines.append(f"- {status} {entry.channel.title} (@{entry.channel.telegram_handle})")
-
-    keyboard_rows = [
-        [InlineKeyboardButton(text="Curated channels", callback_data="noop")]
-    ]
-    for channel in curated_channels:
-        subscription = subscription_map.get(channel.id)
-        keyboard_rows.append(
-            [
-                InlineKeyboardButton(
-                    text=_build_toggle_button_text(channel.title, bool(subscription and subscription.enabled)),
-                    callback_data=f"toggle-sub:{channel.id}:0",
-                )
-            ]
+def _build_channels_view(session, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    channel_entries = UserChannelService(session).list_user_added_channels(user_id)
+    if not channel_entries:
+        return (
+            "Your channels list is empty.\nUse /addchannel to add a public Telegram source.",
+            InlineKeyboardMarkup(inline_keyboard=[]),
         )
 
-    keyboard_rows.append(
-        [InlineKeyboardButton(text="Your channels", callback_data="noop")]
-    )
-    for entry in user_channels:
+    lines = ["Your channels:"]
+    keyboard_rows = []
+    for entry in channel_entries:
+        status = _format_enabled_state(entry.subscription.enabled)
+        lines.append(f"- {status} {entry.channel.title} (@{entry.channel.telegram_handle})")
         keyboard_rows.append(
             [
                 InlineKeyboardButton(
                     text=_build_toggle_button_text(entry.channel.title, entry.subscription.enabled),
-                    callback_data=f"toggle-sub:{entry.channel.id}:0",
+                    callback_data=f"toggle-sub:{entry.channel.id}",
                 ),
                 InlineKeyboardButton(
                     text="Remove",
@@ -414,31 +404,25 @@ def _build_main_channels_view(session, user_id: int) -> tuple[str, InlineKeyboar
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
 
-def _build_topic_channels_view(session, user_id: int, topic_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    catalog_service = CatalogService(session)
-    subscription_service = SubscriptionService(session)
+def _build_period_text(window_days: int) -> str:
+    return (
+        f"Current digest period: {_format_period_label(window_days)}.\n"
+        "Your digest will use only enabled user-added channels in this time window."
+    )
 
-    topic = catalog_service.get_topic(topic_id)
-    channels = catalog_service.list_channels(topic_id=topic_id)
-    subscription_map = subscription_service.get_subscription_map(user_id)
-    text = f"Channels in topic: {topic.name}" if topic is not None else "Curated channels."
 
-    keyboard_rows = []
-    for channel in channels:
-        subscription = subscription_map.get(channel.id)
-        keyboard_rows.append(
+def _build_period_keyboard(current_days: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=_build_toggle_button_text(channel.title, bool(subscription and subscription.enabled)),
-                    callback_data=f"toggle-sub:{channel.id}:{topic_id}",
+                    text=_build_period_button_label(days, current_days),
+                    callback_data=f"set-period:{days}",
                 )
+                for days in ALLOWED_DIGEST_WINDOW_DAYS
             ]
-        )
-
-    keyboard_rows.append(
-        [InlineKeyboardButton(text="Back to topics", callback_data="show-topics")]
+        ]
     )
-    return text, InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
 
 def _build_ingestion_note(ingestion_runs: list) -> str:
@@ -490,9 +474,10 @@ def _build_help_text() -> str:
         "Commands:\n"
         "/start - create or refresh your Telegram profile\n"
         "/link - generate a short-lived web link code\n"
-        "/channels - manage curated and user-added channel subscriptions\n"
+        "/channels - manage your user-added channels\n"
         "/addchannel - add a public Telegram channel by @username or t.me link\n"
-        "/digest - fetch posts and send the latest digest"
+        "/period - choose the digest period: 1, 3, or 7 days\n"
+        "/digest - fetch recent posts from your enabled channels and send the latest digest"
     )
 
 
@@ -502,6 +487,15 @@ def _build_toggle_button_text(channel_title: str, enabled: bool) -> str:
 
 def _format_enabled_state(enabled: bool) -> str:
     return "ON" if enabled else "OFF"
+
+
+def _build_period_button_label(days: int, current_days: int) -> str:
+    prefix = "* " if days == current_days else ""
+    return f"{prefix}{_format_period_label(days)}"
+
+
+def _format_period_label(days: int) -> str:
+    return "1 day" if days == 1 else f"{days} days"
 
 
 def _extract_command_argument(text: str | None) -> str:

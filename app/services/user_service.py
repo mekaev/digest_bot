@@ -7,6 +7,9 @@ from sqlalchemy.orm import Session
 
 from app.db.models import DigestSchedule, TelegramLinkCode, User
 
+ALLOWED_DIGEST_WINDOW_DAYS = (1, 3, 7)
+DEFAULT_DIGEST_WINDOW_DAYS = 7
+
 
 class UserService:
     def __init__(self, session: Session) -> None:
@@ -45,6 +48,38 @@ class UserService:
         return self.session.scalar(
             select(User).where(User.telegram_user_id == telegram_user_id)
         )
+
+    def get_digest_schedule(self, user_id: int) -> DigestSchedule:
+        self._require_user(user_id)
+        schedule = self.session.scalar(
+            select(DigestSchedule).where(DigestSchedule.user_id == user_id)
+        )
+        if schedule is None:
+            self._ensure_digest_schedule(user_id)
+            self.session.commit()
+            schedule = self.session.scalar(
+                select(DigestSchedule).where(DigestSchedule.user_id == user_id)
+            )
+        if schedule is None:
+            raise ValueError(f"Digest schedule was not created for user_id: {user_id}")
+        return schedule
+
+    def get_digest_window_days(self, user_id: int) -> int:
+        schedule = self.get_digest_schedule(user_id)
+        window_days = int(getattr(schedule, "window_days", DEFAULT_DIGEST_WINDOW_DAYS) or DEFAULT_DIGEST_WINDOW_DAYS)
+        if window_days not in ALLOWED_DIGEST_WINDOW_DAYS:
+            return DEFAULT_DIGEST_WINDOW_DAYS
+        return window_days
+
+    def set_digest_window_days(self, user_id: int, window_days: int) -> DigestSchedule:
+        if window_days not in ALLOWED_DIGEST_WINDOW_DAYS:
+            raise ValueError("Digest period must be 1, 3, or 7 days.")
+
+        schedule = self.get_digest_schedule(user_id)
+        schedule.window_days = window_days
+        self.session.commit()
+        self.session.refresh(schedule)
+        return schedule
 
     def get_or_create_link_code(self, user_id: int, ttl_minutes: int = 30) -> TelegramLinkCode:
         now = datetime.now(timezone.utc)
@@ -106,6 +141,7 @@ class UserService:
                     user_id=user_id,
                     enabled=True,
                     frequency="daily",
+                    window_days=DEFAULT_DIGEST_WINDOW_DAYS,
                 )
             )
 
@@ -126,3 +162,9 @@ class UserService:
         if value.tzinfo is None:
             return value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
+
+    def _require_user(self, user_id: int) -> User:
+        user = self.session.get(User, user_id)
+        if user is None:
+            raise ValueError(f"Unknown user_id: {user_id}")
+        return user

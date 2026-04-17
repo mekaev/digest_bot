@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.db.models import Channel, Digest, DigestItem, Post, Subscription
 from app.digest.ranking import score_post_text
 from app.services.llm import TogetherLLM
+from app.services.user_service import UserService
 
 DEFAULT_DIGEST_MAX_ITEMS = 5
 MAX_DIGEST_SUMMARY_LENGTH = 220
@@ -47,25 +48,30 @@ class DigestService:
         self,
         user_id: int,
         max_items: int = DEFAULT_DIGEST_MAX_ITEMS,
-        since_hours: int = 72,
+        since_hours: int | None = None,
     ) -> DigestGenerationResult:
+        window_days = self._resolve_window_days(user_id, since_hours)
         subscribed_channels = list(
             self.session.scalars(
                 select(Channel)
                 .join(Subscription, Subscription.channel_id == Channel.id)
-                .where(Subscription.user_id == user_id, Subscription.enabled.is_(True))
+                .where(
+                    Subscription.user_id == user_id,
+                    Subscription.enabled.is_(True),
+                    Channel.is_user_added.is_(True),
+                )
                 .order_by(Channel.title.asc())
             )
         )
         if not subscribed_channels:
             return DigestGenerationResult(
                 digest=None,
-                message_text="No active subscriptions yet. Use /channels to select curated sources.",
+                message_text="No enabled channels yet. Use /addchannel to add a public source.",
                 has_content=False,
             )
 
         channel_ids = [channel.id for channel in subscribed_channels]
-        threshold = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+        threshold = datetime.now(timezone.utc) - timedelta(days=window_days)
         posts = list(
             self.session.scalars(
                 select(Post)
@@ -77,7 +83,7 @@ class DigestService:
         if not ranked_posts:
             return DigestGenerationResult(
                 digest=None,
-                message_text="No fresh posts found for your current subscriptions.",
+                message_text=f"No posts found for the last {window_days} day(s) in your enabled channels.",
                 has_content=False,
             )
 
@@ -141,7 +147,14 @@ class DigestService:
         for post in unique_posts:
             published_at = _coerce_utc(post.published_at)
             age_hours = max((now - published_at).total_seconds() / 3600.0, 0.0)
-            score = score_post_text(post.cleaned_text, age_hours=age_hours)
+            score = score_post_text(
+                post.cleaned_text,
+                age_hours=age_hours,
+                views=post.views_count,
+                reactions=post.reactions_count,
+                forwards=post.forwards_count,
+                comments=post.comments_count,
+            )
             scored.append((post, score))
 
         scored.sort(key=lambda item: (item[1], item[0].published_at), reverse=True)
@@ -253,6 +266,13 @@ class DigestService:
         if len(summary) <= MAX_DIGEST_SUMMARY_LENGTH:
             return summary
         return f"{summary[: MAX_DIGEST_SUMMARY_LENGTH - 3].rstrip()}..."
+
+    def _resolve_window_days(self, user_id: int, since_hours: int | None) -> int:
+        if since_hours is None:
+            return UserService(self.session).get_digest_window_days(user_id)
+        normalized_hours = max(int(since_hours), 24)
+        derived_days = (normalized_hours + 23) // 24
+        return max(derived_days, 1)
 
 
 def _coerce_utc(value: datetime) -> datetime:

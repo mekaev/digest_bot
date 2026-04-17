@@ -2,6 +2,46 @@
 
 ---
 
+## [2026-04-17 13:20] User-added-only bot flow + digest period and ranking
+### Current state
+- Curated channels are removed from the visible bot UX and `/channels` now shows only user-added channels for the current user.
+- Bot users can manage only their own user-added sources in the current Telegram flow: enable, disable, remove, and add new public channels.
+- A digest period selector is now available with three fixed options: `1 day`, `3 days`, and `7 days`, with `7 days` as the default.
+- Digest generation now filters posts by the selected window, ranks candidates, and truncates output to top `5` items.
+- Ranking now uses simple engagement plus recency heuristics over views, reactions, forwards, comments, and age, while missing metrics safely fall back to `0`.
+
+### Decisions made
+- Kept the existing modular monolith and reused `DigestSchedule` to store `window_days` instead of introducing a new preference table.
+- Left curated catalog data in the database and services for compatibility, but removed it from the active bot product path.
+- Reused the existing Telethon ingest path and only narrowed the `/digest` bot scenario to enabled user-added channels.
+- Added lightweight post metric columns directly to `posts` so ranking stays simple and explainable.
+
+### Problems / blockers
+- Existing curated data is still seeded for compatibility and web surface coverage, but it is intentionally ignored in the current bot digest flow.
+- If Telegram does not expose one of the engagement fields for a message, ranking degrades gracefully but becomes less informative for that post.
+- RAG and broader web polish are still out of scope for this slice.
+
+### Files changed
+- `app/bot/handlers/start.py`
+- `app/db/models.py`
+- `app/db/session.py`
+- `app/digest/ranking.py`
+- `app/ingestion/service.py`
+- `app/ingestion/telegram_client.py`
+- `app/services/digest_service.py`
+- `app/services/user_channel_service.py`
+- `app/services/user_service.py`
+- `tests/test_mvp_slice.py`
+- `docs/Evolution.md`
+
+### Next step
+- Build either RAG over stored posts/digests or a small web polish slice on top of the new user-added-only digest workflow.
+
+### Prompt handoff
+The Telegram-first MVP now treats user-added public channels as the only bot-facing source model. `/channels` is user-added-only, `/period` stores a digest window of `1d/3d/7d`, `/digest` uses only enabled user-added channels within that window, and ranking/top-N selection are now part of the generation path. The next slice should either add RAG over stored posts/digests or improve the web surface without reintroducing curated bot UX, Topics, or a new frontend architecture.
+
+---
+
 ## [2026-04-17 12:40] User-added public channels + bot UX cleanup
 ### Current state
 - User-added public Telegram channels are already supported through the existing Telethon validation layer.
