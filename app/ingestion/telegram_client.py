@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import re
+import sqlite3
 from typing import Any
 from urllib.parse import urlparse
 
@@ -92,38 +93,51 @@ class TelegramIngestionClient:
                 "Telethon ingestion is not configured. Set TELEGRAM_API_ID and TELEGRAM_API_HASH."
             )
 
-        async with TelegramClient(str(self.session_path), self.api_id, self.api_hash) as client:
-            if allow_login:
-                if not self.phone:
-                    raise IngestionConfigurationError(
-                        "TELEGRAM_PHONE is required for the first Telethon authorization."
-                    )
-                await client.start(phone=self.phone)
-            else:
-                await client.connect()
-                if not await client.is_user_authorized():
-                    raise IngestionConfigurationError(
-                        "Telethon session is not authorized. Run scripts/ingest_once.py first."
-                    )
+        try:
+            async with TelegramClient(str(self.session_path), self.api_id, self.api_hash) as client:
+                if allow_login:
+                    if not self.phone:
+                        raise IngestionConfigurationError(
+                            "TELEGRAM_PHONE is required for the first Telethon authorization."
+                        )
+                    await client.start(phone=self.phone)
+                else:
+                    await client.connect()
+                    if not await client.is_user_authorized():
+                        raise IngestionConfigurationError(
+                            "Telethon session is not authorized. Run scripts/ingest_once.py first."
+                        )
 
-            try:
-                entity = await client.get_entity(normalized_handle)
-            except UsernameInvalidError as exc:
-                raise ChannelValidationError(
-                    "Send a valid public channel as @username or https://t.me/username."
-                ) from exc
-            except UsernameNotOccupiedError as exc:
-                raise ChannelValidationError(
-                    f"Channel @{normalized_handle} was not found or is unavailable."
-                ) from exc
-            except ChannelPrivateError as exc:
-                raise ChannelValidationError(
-                    "Private channels are not supported. Add a public channel instead."
-                ) from exc
-            except ValueError as exc:
-                raise ChannelValidationError(
-                    f"Channel @{normalized_handle} was not found or is unavailable."
-                ) from exc
+                try:
+                    entity = await client.get_entity(normalized_handle)
+                except UsernameInvalidError as exc:
+                    raise ChannelValidationError(
+                        "Send a valid public channel as @username or https://t.me/username."
+                    ) from exc
+                except UsernameNotOccupiedError as exc:
+                    raise ChannelValidationError(
+                        f"Channel @{normalized_handle} was not found or is unavailable."
+                    ) from exc
+                except ChannelPrivateError as exc:
+                    raise ChannelValidationError(
+                        "Private channels are not supported. Add a public channel instead."
+                    ) from exc
+                except ValueError as exc:
+                    raise ChannelValidationError(
+                        f"Channel @{normalized_handle} was not found or is unavailable."
+                    ) from exc
+        except (ChannelValidationError, IngestionConfigurationError):
+            raise
+        except (ConnectionError, OSError, sqlite3.Error, PermissionError) as exc:
+            raise IngestionConfigurationError(
+                "Telethon connection failed while validating the channel. "
+                "Check the local session and run scripts/ingest_once.py if needed."
+            ) from exc
+        except ValueError as exc:
+            raise IngestionConfigurationError(
+                "Telethon session could not be opened cleanly. "
+                "Run scripts/ingest_once.py to refresh the local session."
+            ) from exc
 
         if not isinstance(entity, types.Channel):
             raise ChannelValidationError("Only public Telegram channels are supported.")
@@ -153,41 +167,54 @@ class TelegramIngestionClient:
             )
 
         normalized_handle = channel_handle.lstrip("@")
-        async with TelegramClient(str(self.session_path), self.api_id, self.api_hash) as client:
-            if allow_login:
-                if not self.phone:
-                    raise IngestionConfigurationError(
-                        "TELEGRAM_PHONE is required for the first Telethon authorization."
-                    )
-                await client.start(phone=self.phone)
-            else:
-                await client.connect()
-                if not await client.is_user_authorized():
-                    raise IngestionConfigurationError(
-                        "Telethon session is not authorized. Run scripts/ingest_once.py first."
-                    )
+        try:
+            async with TelegramClient(str(self.session_path), self.api_id, self.api_hash) as client:
+                if allow_login:
+                    if not self.phone:
+                        raise IngestionConfigurationError(
+                            "TELEGRAM_PHONE is required for the first Telethon authorization."
+                        )
+                    await client.start(phone=self.phone)
+                else:
+                    await client.connect()
+                    if not await client.is_user_authorized():
+                        raise IngestionConfigurationError(
+                            "Telethon session is not authorized. Run scripts/ingest_once.py first."
+                        )
 
-            entity = await client.get_entity(normalized_handle)
-            messages: list[TelegramMessage] = []
-            async for message in client.iter_messages(entity, limit=limit):
-                raw_text = getattr(message, "message", "") or ""
-                published_at = getattr(message, "date", None) or datetime.now(timezone.utc)
-                message_id = int(getattr(message, "id", 0))
-                messages.append(
-                    TelegramMessage(
-                        telegram_message_id=message_id,
-                        raw_text=raw_text,
-                        cleaned_text=_clean_text(raw_text),
-                        channel_handle=normalized_handle,
-                        published_at=published_at,
-                        source_url=self._build_source_url(normalized_handle, message_id),
-                        views_count=_coerce_metric(getattr(message, "views", 0)),
-                        reactions_count=_extract_reactions_count(message),
-                        forwards_count=_coerce_metric(getattr(message, "forwards", 0)),
-                        comments_count=_extract_comments_count(message),
+                entity = await client.get_entity(normalized_handle)
+                messages: list[TelegramMessage] = []
+                async for message in client.iter_messages(entity, limit=limit):
+                    raw_text = getattr(message, "message", "") or ""
+                    published_at = getattr(message, "date", None) or datetime.now(timezone.utc)
+                    message_id = int(getattr(message, "id", 0))
+                    messages.append(
+                        TelegramMessage(
+                            telegram_message_id=message_id,
+                            raw_text=raw_text,
+                            cleaned_text=_clean_text(raw_text),
+                            channel_handle=normalized_handle,
+                            published_at=published_at,
+                            source_url=self._build_source_url(normalized_handle, message_id),
+                            views_count=_coerce_metric(getattr(message, "views", 0)),
+                            reactions_count=_extract_reactions_count(message),
+                            forwards_count=_coerce_metric(getattr(message, "forwards", 0)),
+                            comments_count=_extract_comments_count(message),
+                        )
                     )
-                )
-            return messages
+                return messages
+        except IngestionConfigurationError:
+            raise
+        except (ConnectionError, OSError, sqlite3.Error, PermissionError) as exc:
+            raise IngestionConfigurationError(
+                "Telethon connection failed while fetching channel posts. "
+                "Check the local session and run scripts/ingest_once.py if needed."
+            ) from exc
+        except ValueError as exc:
+            raise IngestionConfigurationError(
+                "Telethon session could not be opened cleanly. "
+                "Run scripts/ingest_once.py to refresh the local session."
+            ) from exc
 
     def _build_source_url(self, channel_handle: str, message_id: int) -> str:
         return f"https://t.me/{channel_handle.lstrip('@')}/{message_id}"

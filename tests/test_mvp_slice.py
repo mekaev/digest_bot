@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, inspect, select
@@ -10,7 +11,13 @@ from sqlalchemy.orm import sessionmaker
 
 os.environ.setdefault("BOT_TOKEN", "123456:TESTTOKEN")
 
-from app.bot.handlers.start import MAIN_KEYBOARD, _build_channels_view, _build_help_text, _build_period_text
+from app.bot.handlers import start as bot_start
+from app.bot.handlers.start import (
+    MAIN_KEYBOARD,
+    _build_channels_view,
+    _build_help_text,
+    _build_period_text,
+)
 from app.config import get_settings
 from app.db.base import Base
 from app.db.models import Channel, Digest, DigestItem, Post, Subscription, TelegramLinkCode, Topic
@@ -18,14 +25,17 @@ from app.db.session import SessionLocal, configure_database
 from app.ingestion.service import IngestionService
 from app.ingestion.telegram_client import (
     ChannelValidationError,
+    IngestionConfigurationError,
     TelegramChannel,
     TelegramIngestionClient,
     TelegramMessage,
+    normalize_channel_reference,
 )
+from app.rag.qa import QAService
 from app.services.catalog_service import CatalogService
 from app.services.digest_service import DEFAULT_DIGEST_MAX_ITEMS, DIGEST_SYSTEM_PROMPT, DigestService
 from app.services.subscription_service import SubscriptionService
-from app.services.user_channel_service import UserChannelService
+from app.services.user_channel_service import AddChannelResult, UserChannelService
 from app.services.user_service import (
     ALLOWED_DIGEST_WINDOW_DAYS,
     DEFAULT_DIGEST_WINDOW_DAYS,
@@ -146,6 +156,36 @@ class FakeTelegramValidationClient:
         if self.result is None:
             raise AssertionError("FakeTelegramValidationClient requires result or error")
         return self.result
+
+
+class DummyFromUser:
+    def __init__(self, user_id: int, username: str, full_name: str) -> None:
+        self.id = user_id
+        self.username = username
+        self.full_name = full_name
+
+
+class DummyMessage:
+    def __init__(self, text: str, user_id: int = 9001, username: str = "botuser", full_name: str = "Bot User") -> None:
+        self.text = text
+        self.from_user = DummyFromUser(user_id=user_id, username=username, full_name=full_name)
+        self.answers: list[dict[str, object]] = []
+
+    async def answer(self, text: str, reply_markup=None) -> None:
+        self.answers.append(
+            {
+                "text": text,
+                "reply_markup": reply_markup,
+            }
+        )
+
+
+class DummyFSMContext:
+    def __init__(self) -> None:
+        self.cleared = False
+
+    async def clear(self) -> None:
+        self.cleared = True
 
 
 class MVPSliceTests(SessionTestMixin, unittest.TestCase):
@@ -325,6 +365,56 @@ class UserAddedChannelTests(SessionTestMixin, unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(stored_subscription)
         self.assertTrue(stored_subscription.enabled)
 
+    async def test_add_public_channel_accepts_t_me_url(self) -> None:
+        session, _engine = self.make_session()
+        user = UserService(session).upsert_telegram_user(
+            telegram_user_id=504,
+            username="urladder",
+            display_name="URL Adder",
+        )
+        client = FakeTelegramValidationClient(
+            result=TelegramChannel(
+                telegram_handle="publicsource",
+                title="Public Source",
+                description="",
+            )
+        )
+
+        result = await UserChannelService(session, client=client).add_public_channel_for_user(
+            user.id,
+            "https://t.me/PublicSource",
+        )
+
+        self.assertTrue(result.channel_created)
+        self.assertEqual(client.calls, [("https://t.me/PublicSource", False)])
+        self.assertEqual(result.channel.telegram_handle, "publicsource")
+
+    def test_normalize_channel_reference_supports_public_handles_and_t_me_links(self) -> None:
+        self.assertEqual(normalize_channel_reference("@PublicSource"), "publicsource")
+        self.assertEqual(normalize_channel_reference("https://t.me/PublicSource"), "publicsource")
+        self.assertEqual(normalize_channel_reference("https://www.t.me/PublicSource"), "publicsource")
+
+    async def test_validate_public_channel_wraps_runtime_value_error_as_config_error(self) -> None:
+        class BrokenTelethonClient:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            async def connect(self) -> None:
+                raise ValueError("too many values to unpack (expected 5)")
+
+        client = TelegramIngestionClient()
+
+        with patch.object(client, "is_configured", return_value=True):
+            with patch("app.ingestion.telegram_client.TelegramClient", new=BrokenTelethonClient):
+                with self.assertRaisesRegex(IngestionConfigurationError, "refresh the local session"):
+                    await client.validate_public_channel("@publicsource")
+
     async def test_add_public_channel_rejects_invalid_input(self) -> None:
         session, _engine = self.make_session()
         user = UserService(session).upsert_telegram_user(
@@ -408,6 +498,123 @@ class UserAddedChannelTests(SessionTestMixin, unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(list(session.scalars(select(Channel))), [])
                 self.assertEqual(list(session.scalars(select(Subscription))), [])
+
+
+class BotAddChannelFlowTests(SessionTestMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_handle_add_channel_submission_succeeds_for_at_username_without_crash(self) -> None:
+        session, _engine = self.make_session()
+        message = DummyMessage("@publicsource")
+        state = DummyFSMContext()
+        call_log: list[str] = []
+
+        async def fake_add_public_channel_for_user(self, user_id: int, channel_reference: str, allow_login: bool = False):
+            call_log.append(channel_reference)
+            return AddChannelResult(
+                channel=Channel(
+                    id=1,
+                    topic_id=1,
+                    telegram_handle="publicsource",
+                    title="Public Source",
+                    description="",
+                    is_active=True,
+                    is_user_added=True,
+                    added_by_user_id=user_id,
+                ),
+                subscription=Subscription(
+                    id=1,
+                    user_id=user_id,
+                    channel_id=1,
+                    enabled=True,
+                    frequency="daily",
+                ),
+                channel_created=True,
+                subscription_created=True,
+                already_enabled=False,
+            )
+
+        with patch.object(bot_start, "SessionLocal", new=lambda: session):
+            with patch.object(UserChannelService, "add_public_channel_for_user", new=fake_add_public_channel_for_user):
+                await bot_start._handle_add_channel_submission(message, state, "@publicsource")
+
+        self.assertEqual(call_log, ["@publicsource"])
+        self.assertTrue(state.cleared)
+        self.assertEqual(len(message.answers), 1)
+        self.assertIn("@publicsource", message.answers[0]["text"])
+        self.assertIn("added and enabled", message.answers[0]["text"])
+
+    async def test_handle_add_channel_submission_succeeds_for_t_me_url_without_crash(self) -> None:
+        session, _engine = self.make_session()
+        message = DummyMessage("https://t.me/publicsource")
+        state = DummyFSMContext()
+        call_log: list[str] = []
+
+        async def fake_add_public_channel_for_user(self, user_id: int, channel_reference: str, allow_login: bool = False):
+            call_log.append(channel_reference)
+            return AddChannelResult(
+                channel=Channel(
+                    id=2,
+                    topic_id=1,
+                    telegram_handle="publicsource",
+                    title="Public Source",
+                    description="",
+                    is_active=True,
+                    is_user_added=True,
+                    added_by_user_id=user_id,
+                ),
+                subscription=Subscription(
+                    id=2,
+                    user_id=user_id,
+                    channel_id=2,
+                    enabled=True,
+                    frequency="daily",
+                ),
+                channel_created=True,
+                subscription_created=True,
+                already_enabled=False,
+            )
+
+        with patch.object(bot_start, "SessionLocal", new=lambda: session):
+            with patch.object(UserChannelService, "add_public_channel_for_user", new=fake_add_public_channel_for_user):
+                await bot_start._handle_add_channel_submission(message, state, "https://t.me/publicsource")
+
+        self.assertEqual(call_log, ["https://t.me/publicsource"])
+        self.assertTrue(state.cleared)
+        self.assertEqual(len(message.answers), 1)
+        self.assertIn("@publicsource", message.answers[0]["text"])
+
+    async def test_handle_add_channel_submission_returns_validation_error_without_crash(self) -> None:
+        session, _engine = self.make_session()
+        message = DummyMessage("bad channel")
+        state = DummyFSMContext()
+
+        async def fake_add_public_channel_for_user(self, user_id: int, channel_reference: str, allow_login: bool = False):
+            raise ChannelValidationError("Send a valid public channel as @username or https://t.me/username.")
+
+        with patch.object(bot_start, "SessionLocal", new=lambda: session):
+            with patch.object(UserChannelService, "add_public_channel_for_user", new=fake_add_public_channel_for_user):
+                await bot_start._handle_add_channel_submission(message, state, "bad channel")
+
+        self.assertFalse(state.cleared)
+        self.assertEqual(len(message.answers), 1)
+        self.assertIn("Send a valid public channel", message.answers[0]["text"])
+
+    async def test_handle_add_channel_submission_returns_runtime_config_error_without_crash(self) -> None:
+        session, _engine = self.make_session()
+        message = DummyMessage("@publicsource")
+        state = DummyFSMContext()
+
+        async def fake_add_public_channel_for_user(self, user_id: int, channel_reference: str, allow_login: bool = False):
+            raise IngestionConfigurationError(
+                "Telethon session could not be opened cleanly. Run scripts/ingest_once.py to refresh the local session."
+            )
+
+        with patch.object(bot_start, "SessionLocal", new=lambda: session):
+            with patch.object(UserChannelService, "add_public_channel_for_user", new=fake_add_public_channel_for_user):
+                await bot_start._handle_add_channel_submission(message, state, "@publicsource")
+
+        self.assertFalse(state.cleared)
+        self.assertEqual(len(message.answers), 1)
+        self.assertIn("scripts/ingest_once.py", message.answers[0]["text"])
 
 
 class BotUXTests(SessionTestMixin, unittest.TestCase):
@@ -893,7 +1100,110 @@ class DigestPromptTests(SessionTestMixin, unittest.TestCase):
         self.assertEqual(len(digest_items), DEFAULT_DIGEST_MAX_ITEMS)
 
 
-class WebSurfaceTests(unittest.TestCase):
+class AssistantServiceTests(SessionTestMixin, unittest.TestCase):
+    def test_retrieval_respects_user_data_boundaries(self) -> None:
+        session, _engine = self.make_session()
+        first_user = UserService(session).upsert_telegram_user(
+            telegram_user_id=801,
+            username="firstassistant",
+            display_name="First Assistant User",
+        )
+        second_user = UserService(session).upsert_telegram_user(
+            telegram_user_id=802,
+            username="secondassistant",
+            display_name="Second Assistant User",
+        )
+        first_channel = self.create_user_added_channel(session, first_user.id, "mcpalpha", "MCP Alpha", enabled=True)
+        second_channel = self.create_user_added_channel(session, second_user.id, "mcpbeta", "MCP Beta", enabled=True)
+
+        now = datetime.now(timezone.utc)
+        session.add_all(
+            [
+                Post(
+                    channel_id=first_channel.id,
+                    telegram_message_id=1001,
+                    raw_text="MCP server update",
+                    cleaned_text="OpenAI ecosystem got a fresh MCP server update for tool integrations.",
+                    source_url="https://t.me/mcpalpha/1001",
+                    published_at=now - timedelta(hours=2),
+                ),
+                Post(
+                    channel_id=second_channel.id,
+                    telegram_message_id=1002,
+                    raw_text="Other MCP update",
+                    cleaned_text="Another user's channel also wrote about MCP rollout details.",
+                    source_url="https://t.me/mcpbeta/1002",
+                    published_at=now - timedelta(hours=1),
+                ),
+            ]
+        )
+        session.commit()
+
+        response = QAService(session, llm=DummyLLM()).answer(
+            user_id=first_user.id,
+            question="Какие каналы писали про MCP?",
+            window_days=7,
+        )
+
+        self.assertTrue(response.sources)
+        self.assertEqual({source.channel_name for source in response.sources}, {"MCP Alpha"})
+        self.assertNotIn("MCP Beta", response.answer_text)
+
+    def test_no_results_are_graceful(self) -> None:
+        session, _engine = self.make_session()
+        user = UserService(session).upsert_telegram_user(
+            telegram_user_id=803,
+            username="nogrok",
+            display_name="No Grok",
+        )
+        self.create_user_added_channel(session, user.id, "emptyassistant", "Empty Assistant", enabled=True)
+
+        response = QAService(session, llm=DummyLLM()).answer(
+            user_id=user.id,
+            question="Что было по теме Grok за неделю?",
+            window_days=7,
+        )
+
+        self.assertTrue(response.used_fallback)
+        self.assertTrue(response.weak_evidence)
+        self.assertEqual(response.sources, [])
+        self.assertIn("Недостаточно данных", response.answer_text)
+
+    def test_fallback_answer_contains_citations_without_external_llm(self) -> None:
+        session, _engine = self.make_session()
+        user = UserService(session).upsert_telegram_user(
+            telegram_user_id=804,
+            username="fallbackassistant",
+            display_name="Fallback Assistant",
+        )
+        channel = self.create_user_added_channel(session, user.id, "openaifeed", "OpenAI Feed", enabled=True)
+
+        session.add(
+            Post(
+                channel_id=channel.id,
+                telegram_message_id=1101,
+                raw_text="OpenAI ships MCP update",
+                cleaned_text="OpenAI shipped a new MCP integration update and refreshed developer docs for tool calling.",
+                source_url="https://t.me/openaifeed/1101",
+                published_at=datetime.now(timezone.utc) - timedelta(hours=3),
+            )
+        )
+        session.commit()
+
+        response = QAService(session, llm=DummyLLM()).answer(
+            user_id=user.id,
+            question="Что нового по OpenAI за 3 дня?",
+            window_days=3,
+        )
+
+        self.assertTrue(response.used_fallback)
+        self.assertFalse(response.weak_evidence)
+        self.assertGreaterEqual(len(response.sources), 1)
+        self.assertIn("[1]", response.answer_text)
+        self.assertIn("OpenAI Feed", response.answer_text)
+
+
+class WebSurfaceTests(SessionTestMixin, unittest.TestCase):
     def make_web_client(self) -> TestClient:
         default_database_url = get_settings().database_url
         data_dir = Path(__file__).resolve().parents[1] / "data"
@@ -950,11 +1260,23 @@ class WebSurfaceTests(unittest.TestCase):
     def test_protected_pages_redirect_without_session(self) -> None:
         client = self.make_web_client()
 
-        for path in ("/app", "/app/digests", "/app/subscriptions"):
+        for path in ("/app", "/app/assistant", "/app/digests", "/app/subscriptions"):
             with self.subTest(path=path):
                 response = client.get(path, follow_redirects=False)
                 self.assertEqual(response.status_code, 303)
                 self.assertTrue(response.headers["location"].startswith("/login?next="))
+
+    def test_assistant_post_redirects_without_session(self) -> None:
+        client = self.make_web_client()
+
+        response = client.post(
+            "/app/assistant",
+            data={"question": "Что нового по OpenAI?", "window_days": "7"},
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertTrue(response.headers["location"].startswith("/login?next="))
 
     def test_valid_link_code_redeem_sets_session_and_marks_code_used(self) -> None:
         client = self.make_web_client()
@@ -1114,6 +1436,45 @@ class WebSurfaceTests(unittest.TestCase):
             )
             self.assertIsNotNone(subscription)
             self.assertTrue(subscription.enabled)
+
+    def test_assistant_page_loads_and_ask_returns_citations(self) -> None:
+        client = self.make_web_client()
+        user_id, _code_id, link_code = self.create_user_with_code(
+            telegram_user_id=408,
+            username="assistantviewer",
+            display_name="Assistant Viewer",
+        )
+
+        with SessionLocal() as session:
+            channel = self.create_user_added_channel(session, user_id, "assistantfeed", "Assistant Feed", enabled=True)
+            session.add(
+                Post(
+                    channel_id=channel.id,
+                    telegram_message_id=1201,
+                    raw_text="OpenAI follow-up",
+                    cleaned_text="OpenAI published a new MCP support update for developer tooling and integrations.",
+                    source_url="https://t.me/assistantfeed/1201",
+                    published_at=datetime.now(timezone.utc) - timedelta(hours=4),
+                )
+            )
+            session.commit()
+
+        self.redeem_code(client, link_code)
+
+        page_response = client.get("/app/assistant")
+        self.assertEqual(page_response.status_code, 200)
+        self.assertIn("Ask assistant", page_response.text)
+
+        ask_response = client.post(
+            "/app/assistant",
+            data={"question": "Что нового по OpenAI за 3 дня?", "window_days": "3"},
+            follow_redirects=True,
+        )
+
+        self.assertEqual(ask_response.status_code, 200)
+        self.assertIn("[1]", ask_response.text)
+        self.assertIn("Источники", ask_response.text)
+        self.assertIn("https://t.me/assistantfeed/1201", ask_response.text)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="card">
+    <h1>Assistant</h1>
+    <p>
+        Ask a follow-up question about your recent posts or saved digests.
+        Answers stay grounded in your own enabled channels and render with citations.
+    </p>
+    <p class="helper-text">
+        Examples: «Что нового по OpenAI за 3 дня?», «Какие каналы писали про MCP?», «Что было по теме Grok за неделю?»
+    </p>
+</section>
+
+<section class="card">
+    {% if error_message %}
+        <div class="alert error">{{ error_message }}</div>
+    {% endif %}
+
+    <form class="form-stack" method="post" action="/app/assistant">
+        <label for="question">Question</label>
+        <textarea
+            id="question"
+            name="question"
+            placeholder="Что нового по OpenAI за 3 дня?"
+        >{{ question }}</textarea>
+
+        <div class="grid two">
+            <div>
+                <label for="window_days">Window</label>
+                <select id="window_days" name="window_days">
+                    {% for days in allowed_window_days %}
+                        <option value="{{ days }}" {% if days == selected_window_days %}selected{% endif %}>
+                            {{ days }} day{% if days != 1 %}s{% endif %}
+                        </option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div style="display: flex; align-items: end;">
+                <button type="submit">Ask assistant</button>
+            </div>
+        </div>
+    </form>
+</section>
+
+{% if assistant_result %}
+    <section class="card">
+        <div class="meta">
+            <span>Window: {{ assistant_result.window_days }} day{% if assistant_result.window_days != 1 %}s{% endif %}</span>
+            <span class="badge {% if assistant_result.used_fallback %}muted{% else %}success{% endif %}">
+                {% if assistant_result.used_fallback %}fallback{% else %}llm{% endif %}
+            </span>
+            {% if assistant_result.weak_evidence %}
+                <span class="badge muted">weak evidence</span>
+            {% endif %}
+        </div>
+        <h2>Ответ</h2>
+        <div class="digest-body">{{ assistant_result.answer_text }}</div>
+    </section>
+
+    <section class="stack">
+        <div class="topic-header">
+            <h2>Источники</h2>
+            <p>Only sources available to the current logged-in user are shown here.</p>
+        </div>
+        {% if assistant_result.sources %}
+            {% for source in assistant_result.sources %}
+                <article class="digest-card">
+                    <div class="meta">
+                        <span>[{{ source.index }}] {{ source.channel_name }}</span>
+                        <span>{{ source.published_at_text }}</span>
+                        {% if source.source_url %}
+                            <a href="{{ source.source_url }}" target="_blank" rel="noreferrer">Open source</a>
+                        {% else %}
+                            <span>{{ source.source_label }}</span>
+                        {% endif %}
+                    </div>
+                    <p>{{ source.snippet }}</p>
+                </article>
+            {% endfor %}
+        {% else %}
+            <div class="digest-card">
+                <p>No direct sources found for this query.</p>
+            </div>
+        {% endif %}
+    </section>
+{% endif %}
+{% endblock %}

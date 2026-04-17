@@ -2,6 +2,68 @@
 
 ---
 
+## [2026-04-17 15:00] Bot add-channel crash fix
+### Current state
+- Telegram bot add-channel flow now accepts both `@username` and `https://t.me/username` inputs without crashing.
+- The Telethon validation boundary normalizes runtime failures into app-level errors so the bot can always answer with a user-friendly message.
+- Existing user-added channel management flows still work: enable, disable, remove, and re-add.
+
+### Decisions made
+- Kept the fix at the validation boundary instead of changing the bot flow contract or the persistence model.
+- Treated raw Telethon/runtime failures as configuration-level issues for the bot surface so the handler can degrade gracefully.
+- Added regression coverage for the bot handler path rather than relying only on service-layer tests.
+
+### Problems / blockers
+- Telethon still needs a live local session and network access for real validation, so the exact runtime failure can vary outside the sandbox.
+- The local test environment cannot fully exercise the live Telegram API, so runtime wrapping is covered by regression tests instead.
+
+### Files changed
+- `app/ingestion/telegram_client.py`
+- `tests/test_mvp_slice.py`
+- `docs/Evolution.md`
+
+### Next step
+- Keep the bot flow stable and move on to the next narrow MVP slice without reworking the add-channel contract again.
+
+### Prompt handoff
+The add-channel bug is fixed at the Telethon boundary: the bot now handles `@username` and `https://t.me/...` inputs, and runtime validation failures are converted into user-facing errors instead of crashing the update. The next agent should preserve this contract and only extend the flow if a new narrow slice explicitly requires it.
+
+---
+
+## [2026-04-17 14:10] Minimal web RAG assistant over stored posts
+### Current state
+- Logged-in web users now have a protected `/app/assistant` page inside the existing server-rendered cabinet.
+- The assistant retrieves from already stored `posts` inside the user's own enabled user-added channels and uses the user's own digest items only as a secondary scoring hint.
+- Answers are rendered in Russian with `[1]`, `[2]`, `[3]` citation markers plus a small sources block.
+- If Together AI is disabled or the request fails, the flow still returns a deterministic grounded fallback answer instead of failing hard.
+
+### Decisions made
+- Kept the slice SQLite-first and explainable: retrieval is lexical/hybrid with token overlap, phrase match, channel boost, recency bonus, and digest-item hinting.
+- Kept posts as the primary evidence unit so callers can later swap the retrieval backend to embeddings/vector search without changing the assistant route contract.
+- Reused the existing FastAPI session auth and Jinja templates instead of adding a new frontend surface or API layer.
+
+### Problems / blockers
+- Retrieval is still a first-pass heuristic layer, so semantic paraphrases and multilingual wording can still be missed until embeddings are added later.
+- When Together is configured but unreachable, the request still pays the provider-client retry cost before the deterministic fallback is used.
+
+### Files changed
+- `app/rag/retriever.py`
+- `app/rag/qa.py`
+- `app/api/routes/web.py`
+- `app/api/templates/base.html`
+- `app/api/templates/app_assistant.html`
+- `tests/test_mvp_slice.py`
+- `README.md`
+- `docs/Evolution.md`
+
+### Next step
+- Keep the assistant slice narrow and improve retrieval quality only if needed: better token normalization, lightweight synonym support, or a drop-in embedding backend behind the same `QAService`/retriever interface.
+
+### Prompt handoff
+There is now a minimal but working web RAG assistant in the existing cabinet. It is intentionally SQLite-first and deterministic: `SQLiteRAGRetriever` enforces user boundaries and returns citation metadata, `QAService` builds a grounded Russian answer with a hard fallback path, and `/app/assistant` renders it through the current Jinja flow. The next agent should not rewrite the architecture or add vector infra unless explicitly asked; the clean extension point is the retriever implementation behind the existing service contract.
+
+---
+
 ## [2026-04-17 13:35] Digest ranking normalization + topic dedup cleanup
 ### Current state
 - Digest ranking no longer relies only on absolute engagement numbers across all channels.

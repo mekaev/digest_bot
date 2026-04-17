@@ -230,6 +230,27 @@
             font: inherit;
         }
 
+        textarea,
+        select {
+            width: 100%;
+            padding: 12px 14px;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            font: inherit;
+            background: #fff;
+            color: var(--text);
+        }
+
+        textarea {
+            min-height: 120px;
+            resize: vertical;
+        }
+
+        .helper-text {
+            font-size: 0.92rem;
+            color: var(--text-soft);
+        }
+
         .digest-card,
         .channel-row {
             padding: 20px 24px;
@@ -307,6 +328,7 @@
                         {{ current_user.display_name or current_user.username or ("User #" ~ current_user.id) }}
                     </span>
                     <a href="/app">Profile</a>
+                    <a href="/app/assistant">Assistant</a>
                     <a href="/app/digests">Digests</a>
                     <a href="/app/subscriptions">Subscriptions</a>
                 {% else %}

@@ -8,10 +8,11 @@ from fastapi.templating import Jinja2Templates
 
 from app.db.models import User
 from app.db.session import SessionLocal
+from app.rag.qa import QAResponse, QAService
 from app.services.catalog_service import CatalogService
 from app.services.digest_service import DigestService
 from app.services.subscription_service import SubscriptionService
-from app.services.user_service import UserService
+from app.services.user_service import ALLOWED_DIGEST_WINDOW_DAYS, UserService
 
 
 router = APIRouter(tags=["web"])
@@ -132,6 +133,61 @@ async def app_subscriptions_page(request: Request) -> Response:
     )
 
 
+@router.get("/app/assistant", response_class=HTMLResponse)
+async def app_assistant_page(request: Request) -> Response:
+    with SessionLocal() as session:
+        current_user = _get_current_user(request, session)
+        if current_user is None:
+            return _redirect_to_login(request)
+
+        selected_window_days = UserService(session).get_digest_window_days(current_user.id)
+
+    return _render_assistant_page(
+        request=request,
+        current_user=current_user,
+        selected_window_days=selected_window_days,
+    )
+
+
+@router.post("/app/assistant", response_class=HTMLResponse)
+async def ask_assistant(request: Request) -> Response:
+    with SessionLocal() as session:
+        current_user = _get_current_user(request, session)
+        if current_user is None:
+            return _redirect_to_login(request)
+
+        form_data = await _read_form_data(request)
+        question = form_data.get("question", "").strip()
+        selected_window_days = _parse_window_days(
+            form_data.get("window_days"),
+            current_user.id,
+            session,
+        )
+        if not question:
+            return _render_assistant_page(
+                request=request,
+                current_user=current_user,
+                selected_window_days=selected_window_days,
+                question=question,
+                error_message="Введите вопрос по вашим постам или дайджестам.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+
+        assistant_result = QAService(session).answer(
+            user_id=current_user.id,
+            question=question,
+            window_days=selected_window_days,
+        )
+
+    return _render_assistant_page(
+        request=request,
+        current_user=current_user,
+        selected_window_days=assistant_result.window_days,
+        question=question,
+        assistant_result=assistant_result,
+    )
+
+
 @router.post("/app/subscriptions/{channel_id}")
 async def update_subscription(request: Request, channel_id: int) -> RedirectResponse:
     with SessionLocal() as session:
@@ -231,6 +287,31 @@ def _render_login_page(
     )
 
 
+def _render_assistant_page(
+    request: Request,
+    current_user: User,
+    selected_window_days: int,
+    question: str = "",
+    assistant_result: QAResponse | None = None,
+    error_message: str = "",
+    status_code: int = status.HTTP_200_OK,
+) -> HTMLResponse:
+    return templates.TemplateResponse(
+        request=request,
+        name="app_assistant.html",
+        context={
+            "current_user": current_user,
+            "question": question,
+            "selected_window_days": selected_window_days,
+            "allowed_window_days": ALLOWED_DIGEST_WINDOW_DAYS,
+            "assistant_result": assistant_result,
+            "error_message": error_message,
+            "page_title": "Assistant",
+        },
+        status_code=status_code,
+    )
+
+
 def _safe_next_path(value: str) -> str:
     if value.startswith("/") and not value.startswith("//"):
         return value
@@ -239,6 +320,18 @@ def _safe_next_path(value: str) -> str:
 
 def _parse_enabled_flag(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_window_days(value: str | None, user_id: int, session) -> int:
+    if value is not None:
+        try:
+            parsed_value = int(value)
+        except (TypeError, ValueError):
+            parsed_value = None
+        else:
+            if parsed_value in ALLOWED_DIGEST_WINDOW_DAYS:
+                return parsed_value
+    return UserService(session).get_digest_window_days(user_id)
 
 
 async def _read_form_data(request: Request) -> dict[str, str]:

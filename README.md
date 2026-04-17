@@ -45,3 +45,10 @@ python scripts/run_bot.py
 
 API health check: `GET /health`
 
+## Web cabinet
+
+- Redeem a Telegram `/link` code at `/login` to open the server-rendered cabinet.
+- Main protected pages are `/app`, `/app/digests`, `/app/subscriptions`, and `/app/assistant`.
+- `/app/assistant` answers follow-up questions over the logged-in user's own enabled channels and saved digests, with citations.
+- If Together AI is disabled or unavailable, the assistant falls back to a deterministic snippet-based answer so the MVP remains demoable.
+
