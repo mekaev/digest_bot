@@ -5,6 +5,45 @@
 
 ---
 
+## [2026-04-16 14:30] Minimal web surface via link-code auth
+### Current state
+- Добавлен минимальный server-rendered web surface внутри FastAPI без React/Next.
+- Появились публичные страницы `/` и `/login`, а также protected pages `/app`, `/app/digests`, `/app/subscriptions`.
+- Web auth теперь работает через существующий Telegram link code: redeem помечает код использованным и создает signed session cookie.
+- Пользователь может смотреть свой профиль, сохраненные digests и управлять curated subscriptions из web UI.
+- Для web routes добавлены integration tests; полный `tests/test_mvp_slice.py` проходит локально в `.venv`.
+
+### Decisions made
+- Не трогать Telethon ingest, bot flow, scheduler, RAG, voice и analytics в этом slice.
+- Оставить HTML pages отдельно от существующего JSON API; `catalog` и `subscriptions/{user_id}` не переписывались под auth.
+- Не тянуть внешнюю session dependency: вместо Starlette SessionMiddleware добавлен локальный signed-cookie middleware без изменения архитектуры.
+- Не добавлять новые таблицы; использованы текущие `users`, `telegram_link_codes`, `subscriptions`, `digests`.
+
+### Problems / blockers
+- Для локального прогона web routes в `.venv` пришлось доустановить `jinja2`; зависимость добавлена в `requirements.txt`.
+- SQLite возвращает часть datetime как naive, поэтому redeem flow нормализует `expires_at` в UTC перед проверкой.
+
+### Files changed
+- `app/api/main.py`
+- `app/api/routes/web.py`
+- `app/api/session_middleware.py`
+- `app/api/templates/*`
+- `app/config.py`
+- `app/db/session.py`
+- `app/services/user_service.py`
+- `app/services/digest_service.py`
+- `.env.example`
+- `requirements.txt`
+- `tests/test_mvp_slice.py`
+
+### Next step
+- Следующий узкий slice можно брать уже поверх рабочего web auth surface: либо scheduler/delivery path, либо дальнейшее добивание demo path по execution plan без расширения scope.
+
+### Prompt handoff
+Telegram-first baseline больше не только bot-side: теперь есть минимальный FastAPI web cabinet с landing, link-code auth, profile, digest history и subscriptions. Следующий агент не должен переписывать архитектуру и не должен менять auth-модель. Можно опираться на существующие `UserService.redeem_link_code`, signed session cookie middleware и server-rendered templates.
+
+---
+
 ## [2026-04-16 13:35] First real Telegram digest demo works
 ### Current state
 - Подтвержден рабочий Telegram-first demo path на реальных данных.

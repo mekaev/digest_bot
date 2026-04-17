@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="card">
+    <h1>Saved digests</h1>
+    <p>All digests stored for the current Telegram-linked user, newest first.</p>
+</section>
+
+<section class="stack">
+    {% if digests %}
+        {% for digest in digests %}
+            <article class="digest-card">
+                <div class="meta">
+                    <span>{{ digest.created_at.strftime("%Y-%m-%d %H:%M") if digest.created_at else "Unknown time" }}</span>
+                    <span class="badge {% if digest.delivery_status == 'sent' %}success{% else %}muted{% endif %}">
+                        {{ digest.delivery_status }}
+                    </span>
+                    <span>Status: {{ digest.status }}</span>
+                    <span>{{ digest.source_post_count }} source posts</span>
+                </div>
+                <pre class="digest-body">{{ digest.body_text }}</pre>
+            </article>
+        {% endfor %}
+    {% else %}
+        <div class="digest-card">
+            <p>No digests found for this user yet.</p>
+        </div>
+    {% endif %}
+</section>
+{% endblock %}

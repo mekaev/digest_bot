@@ -1,0 +1,34 @@
+{
+  "topics": [
+    {
+      "slug": "telegram",
+      "name": "Telegram",
+      "description": "Official Telegram ecosystem updates."
+    },
+    {
+      "slug": "bots",
+      "name": "Bots",
+      "description": "Bot platform and automation news."
+    }
+  ],
+  "channels": [
+    {
+      "telegram_handle": "durov",
+      "title": "Pavel Durov",
+      "description": "Public updates from Telegram's founder.",
+      "topic_slug": "telegram"
+    },
+    {
+      "telegram_handle": "telegram",
+      "title": "Telegram",
+      "description": "Official Telegram product announcements.",
+      "topic_slug": "telegram"
+    },
+    {
+      "telegram_handle": "botnews",
+      "title": "BotNews",
+      "description": "Official Bot API updates.",
+      "topic_slug": "bots"
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="card">
+    <h1>Curated subscriptions</h1>
+    <p>
+        Manage curated Telegram channels from web without touching the Telegram bot flow.
+        Each change reuses the existing subscription service and persists to the same SQLite runtime DB.
+    </p>
+</section>
+
+{% for section in topic_sections %}
+    <section class="stack topic-block">
+        <div class="topic-header">
+            <h2>{{ section.topic.name }}</h2>
+            <p>{{ section.topic.description }}</p>
+        </div>
+        {% for item in section.channels %}
+            <div class="channel-row">
+                <div class="channel-copy">
+                    <h3>{{ item.channel.title }}</h3>
+                    <p><strong>{{ item.channel.telegram_handle }}</strong></p>
+                    <p>{{ item.channel.description }}</p>
+                </div>
+                <form method="post" action="/app/subscriptions/{{ item.channel.id }}">
+                    <input type="hidden" name="enabled" value="{{ 'false' if item.enabled else 'true' }}">
+                    <button class="{% if item.enabled %}secondary{% endif %}" type="submit">
+                        {% if item.enabled %}Disable{% else %}Enable{% endif %}
+                    </button>
+                </form>
+            </div>
+        {% else %}
+            <div class="channel-row">
+                <p>No channels available in this topic.</p>
+            </div>
+        {% endfor %}
+    </section>
+{% endfor %}
+{% endblock %}

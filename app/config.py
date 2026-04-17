@@ -18,6 +18,7 @@ class Settings(BaseSettings):
 
     # Telegram bot
     bot_token: str = Field(..., alias="BOT_TOKEN")
+    web_session_secret: str = Field(default="", alias="WEB_SESSION_SECRET")
 
     # Telegram client for Telethon
     telegram_api_id: str = Field(default="", alias="TELEGRAM_API_ID")

@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="card">
+    <h1>Profile</h1>
+    <p>This cabinet is tied to your Telegram identity via one-time link code auth.</p>
+    <div class="grid two">
+        <div class="metric">
+            <strong>{{ current_user.display_name or "Unnamed user" }}</strong>
+            Display name
+        </div>
+        <div class="metric">
+            <strong>@{{ current_user.username if current_user.username else "not-set" }}</strong>
+            Telegram username
+        </div>
+        <div class="metric">
+            <strong>{{ current_user.telegram_user_id }}</strong>
+            Telegram user id
+        </div>
+        <div class="metric">
+            <strong>{{ subscribed_channels|length }}</strong>
+            Active curated subscriptions
+        </div>
+    </div>
+</section>
+
+<section class="card">
+    <h2>Recent digests</h2>
+    {% if recent_digests %}
+        <div class="meta">
+            <span>{{ recent_digests|length }} most recent digests shown</span>
+            <a href="/app/digests">Open full digest history</a>
+        </div>
+        {% for digest in recent_digests %}
+            <div class="digest-card">
+                <div class="meta">
+                    <span>{{ digest.created_at.strftime("%Y-%m-%d %H:%M") if digest.created_at else "Unknown time" }}</span>
+                    <span class="badge {% if digest.delivery_status == 'sent' %}success{% else %}muted{% endif %}">
+                        {{ digest.delivery_status }}
+                    </span>
+                    <span>{{ digest.source_post_count }} source posts</span>
+                </div>
+                <pre class="digest-body">{{ digest.body_text }}</pre>
+            </div>
+        {% endfor %}
+    {% else %}
+        <p>No digests saved yet. Run <strong>/digest</strong> in Telegram after choosing curated channels.</p>
+    {% endif %}
+</section>
+{% endblock %}

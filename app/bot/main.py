@@ -2,6 +2,7 @@ import asyncio
 
 from aiogram import Bot, Dispatcher
 
+from app.bootstrap import bootstrap_application
 from app.bot.handlers import router as handlers_router
 from app.config import get_settings
 from app.logging_config import configure_logging
@@ -16,6 +17,7 @@ def build_dispatcher() -> Dispatcher:
 async def run_polling() -> None:
     settings = get_settings()
     configure_logging(settings)
+    bootstrap_application()
 
     bot = Bot(token=settings.bot_token)
     dispatcher = build_dispatcher()

@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="hero">
+    <span class="badge success">Telegram-first MVP</span>
+    <h1>Curated Telegram digests with a minimal web cabinet.</h1>
+    <p>
+        The bot collects posts from curated Telegram channels, stores them in SQLite,
+        generates concise digests, and lets you review your profile, digests, and subscriptions in web.
+    </p>
+    <p>
+        Web access is intentionally narrow: request a link code in Telegram with <strong>/link</strong>,
+        redeem it here, and continue in the protected cabinet.
+    </p>
+    <div class="button-row">
+        <a class="button" href="{% if current_user %}/app{% else %}/login{% endif %}">
+            {% if current_user %}Open cabinet{% else %}Redeem link code{% endif %}
+        </a>
+        <a class="button secondary" href="/login">Web login</a>
+    </div>
+</section>
+
+<section class="card">
+    <h2>Current demo path</h2>
+    <div class="grid two">
+        <div class="metric">
+            <strong>1</strong>
+            Get or refresh your account in Telegram with <code>/start</code>.
+        </div>
+        <div class="metric">
+            <strong>2</strong>
+            Request a short-lived web code with <code>/link</code>.
+        </div>
+        <div class="metric">
+            <strong>3</strong>
+            Redeem the code here to open your cabinet.
+        </div>
+        <div class="metric">
+            <strong>4</strong>
+            Review saved digests and manage curated subscriptions.
+        </div>
+    </div>
+</section>
+{% endblock %}

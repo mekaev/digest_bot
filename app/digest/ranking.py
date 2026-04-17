@@ -1,4 +1,4 @@
-﻿def rank_messages(messages: list[str], keywords: list[str] | None = None) -> list[tuple[str, float]]:
+def rank_messages(messages: list[str], keywords: list[str] | None = None) -> list[tuple[str, float]]:
     if not messages:
         return []
 
@@ -14,3 +14,13 @@
 
     scored_items.sort(key=lambda item: item[1], reverse=True)
     return scored_items
+
+
+def score_post_text(text: str, age_hours: float) -> float:
+    normalized_text = text.lower().strip()
+    if not normalized_text:
+        return 0.0
+
+    length_bonus = min(len(normalized_text) / 280.0, 1.5)
+    recency_bonus = max(0.0, 2.0 - min(age_hours / 24.0, 2.0))
+    return 1.0 + length_bonus + recency_bonus

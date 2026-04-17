@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="card" style="max-width: 560px; margin: 0 auto;">
+    <h1>Redeem Telegram link code</h1>
+    <p>
+        Open the bot in Telegram, run <strong>/link</strong>, then paste the short-lived code below.
+        A successful redeem creates your web session cookie and redirects you into the cabinet.
+    </p>
+
+    {% if error_message %}
+        <div class="alert error">{{ error_message }}</div>
+    {% endif %}
+
+    <form class="form-stack" method="post" action="/auth/redeem">
+        <input type="hidden" name="next" value="{{ next_path }}">
+        <label for="code">Link code</label>
+        <input
+            id="code"
+            name="code"
+            type="text"
+            value="{{ code }}"
+            placeholder="AB12CD34"
+            autocomplete="one-time-code"
+        >
+        <button type="submit">Redeem and continue</button>
+    </form>
+</section>
+{% endblock %}
