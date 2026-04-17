@@ -1,6 +1,6 @@
 from collections.abc import Generator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.base import Base
@@ -36,6 +36,7 @@ def init_db() -> None:
     import app.db.models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
+    _sync_schema()
 
 
 def get_session() -> Generator[Session, None, None]:
@@ -44,3 +45,29 @@ def get_session() -> Generator[Session, None, None]:
         yield session
     finally:
         session.close()
+
+
+def _sync_schema() -> None:
+    if engine is None:
+        return
+
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
+    if "channels" not in table_names:
+        return
+
+    channel_columns = {column["name"] for column in inspector.get_columns("channels")}
+    statements: list[str] = []
+    if "is_user_added" not in channel_columns:
+        statements.append(
+            "ALTER TABLE channels ADD COLUMN is_user_added BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+    if "added_by_user_id" not in channel_columns:
+        statements.append("ALTER TABLE channels ADD COLUMN added_by_user_id INTEGER")
+
+    if not statements:
+        return
+
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))

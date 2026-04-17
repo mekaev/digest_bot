@@ -20,14 +20,20 @@ class TogetherLLM:
         prompt: str,
         max_tokens: int = 300,
         temperature: float = 0.2,
+        system_prompt: str | None = None,
     ) -> str:
         if not self._client:
             return 'LLM is disabled: TOGETHER_API_KEY is not set.'
 
+        messages: list[dict[str, str]] = []
+        if system_prompt:
+            messages.append({'role': 'system', 'content': system_prompt})
+        messages.append({'role': 'user', 'content': prompt})
+
         try:
             response = self._client.chat.completions.create(
                 model=self.model,
-                messages=[{'role': 'user', 'content': prompt}],
+                messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
             )

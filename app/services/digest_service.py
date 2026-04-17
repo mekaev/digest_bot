@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import re
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -7,6 +8,17 @@ from sqlalchemy.orm import Session
 from app.db.models import Channel, Digest, DigestItem, Post, Subscription
 from app.digest.ranking import score_post_text
 from app.services.llm import TogetherLLM
+
+DEFAULT_DIGEST_MAX_ITEMS = 5
+MAX_DIGEST_SUMMARY_LENGTH = 220
+MAX_DIGEST_SNIPPET_LENGTH = 420
+DIGEST_SYSTEM_PROMPT = (
+    "Ты редактор AI Telegram Digest Bot. "
+    "Всегда отвечай только на русском языке. "
+    "Никогда не используй китайский язык и не вставляй китайские иероглифы. "
+    "Не смешивай языки, кроме названий продуктов, брендов и оригинальных терминов. "
+    "Сохраняй формат компактным, стабильным и пригодным для чтения в Telegram."
+)
 
 
 @dataclass(slots=True)
@@ -34,7 +46,7 @@ class DigestService:
     def generate_digest_for_user(
         self,
         user_id: int,
-        max_items: int = 5,
+        max_items: int = DEFAULT_DIGEST_MAX_ITEMS,
         since_hours: int = 72,
     ) -> DigestGenerationResult:
         subscribed_channels = list(
@@ -69,17 +81,17 @@ class DigestService:
                 has_content=False,
             )
 
+        selected_items: list[tuple[Post, float]] = ranked_posts[:max_items]
         digest = Digest(
             user_id=user_id,
             status="ready",
             delivery_status="pending",
             body_text="",
-            source_post_count=len(ranked_posts),
+            source_post_count=len(selected_items),
         )
         self.session.add(digest)
         self.session.flush()
 
-        selected_items: list[tuple[Post, float]] = ranked_posts[:max_items]
         for post, score in selected_items:
             channel = next(channel for channel in subscribed_channels if channel.id == post.channel_id)
             digest_item = DigestItem(
@@ -141,30 +153,87 @@ class DigestService:
         channels: list[Channel],
     ) -> str:
         channel_titles = {channel.id: channel.title for channel in channels}
-        fallback_lines = ["Your latest digest:"]
-        for index, (post, _score) in enumerate(items, start=1):
-            fallback_lines.append(
-                f"{index}. {channel_titles[post.channel_id]}: {self._build_item_summary(post.cleaned_text)}"
-            )
-            fallback_lines.append(f"Source: {post.source_url}")
-        fallback_text = "\n".join(fallback_lines)
+        fallback_text = self._build_fallback_digest_text(items, channel_titles)
 
         if not self.llm.is_enabled():
             return fallback_text
 
-        snippets = []
-        for post, _score in items:
-            snippets.append(f"- {channel_titles[post.channel_id]}: {post.cleaned_text[:500]}")
-        prompt = (
-            "Create a concise Telegram digest in plain text.\n"
-            "Keep the output compact and readable.\n"
-            "Each item must include the channel name and a short takeaway.\n\n"
-            f"Items:\n{'\n'.join(snippets)}"
-        )
-        llm_text = self.llm.generate(prompt, max_tokens=350, temperature=0.2).strip()
-        if not llm_text or llm_text.startswith("LLM "):
+        prompt = self._build_digest_prompt(items, channel_titles)
+        llm_text = self.llm.generate(
+            prompt,
+            max_tokens=450,
+            temperature=0.1,
+            system_prompt=DIGEST_SYSTEM_PROMPT,
+        ).strip()
+        if not self._is_valid_digest_response(llm_text, expected_items=len(items)):
             return fallback_text
-        return f"{llm_text}\n\n{fallback_text}"
+        return llm_text
+
+    def _build_fallback_digest_text(
+        self,
+        items: list[tuple[Post, float]],
+        channel_titles: dict[int, str],
+    ) -> str:
+        lines = ["Краткий дайджест по вашим каналам:", ""]
+        for index, (post, _score) in enumerate(items, start=1):
+            lines.append(f"{index}. Канал: {channel_titles[post.channel_id]}")
+            lines.append(f"Кратко: {self._build_item_summary(post.cleaned_text)}")
+            lines.append(f"Source: {post.source_url}")
+            if index != len(items):
+                lines.append("")
+        return "\n".join(lines)
+
+    def _build_digest_prompt(
+        self,
+        items: list[tuple[Post, float]],
+        channel_titles: dict[int, str],
+    ) -> str:
+        item_blocks = []
+        for index, (post, _score) in enumerate(items, start=1):
+            snippet = " ".join(post.cleaned_text.split()).strip()[:MAX_DIGEST_SNIPPET_LENGTH]
+            item_blocks.append(
+                "\n".join(
+                    [
+                        f"Item {index}",
+                        f"Channel: {channel_titles[post.channel_id]}",
+                        f"Source URL: {post.source_url}",
+                        f"Post text: {snippet}",
+                    ]
+                )
+            )
+        rendered_items = "\n\n".join(item_blocks)
+
+        return (
+            "Собери компактный Telegram digest по материалам ниже.\n"
+            "Жесткие требования:\n"
+            "- итоговый текст должен быть только на русском языке;\n"
+            "- не использовать китайский язык;\n"
+            "- не смешивать языки, кроме названий продуктов, брендов и оригинальных терминов;\n"
+            "- для каждого пункта дай 1-2 коротких предложения summary на русском;\n"
+            "- обязательно сохрани строку `Source: <ссылка>` для каждого пункта;\n"
+            "- формат должен быть стабильным и компактным.\n\n"
+            "Верни ответ строго в таком формате:\n"
+            "Краткий дайджест по вашим каналам:\n\n"
+            "1. Канал: <название>\n"
+            "Кратко: <1-2 предложения на русском>\n"
+            "Source: <ссылка>\n\n"
+            "2. Канал: <название>\n"
+            "Кратко: <1-2 предложения на русском>\n"
+            "Source: <ссылка>\n\n"
+            f"Используй только {len(items)} лучших материалов.\n\n"
+            f"Материалы:\n\n{rendered_items}"
+        )
+
+    def _is_valid_digest_response(self, text: str, expected_items: int) -> bool:
+        if not text or text.startswith("LLM "):
+            return False
+        if _contains_cjk(text):
+            return False
+        if "Source:" not in text:
+            return False
+        if text.count("Source:") < expected_items:
+            return False
+        return re.search(r"(?m)^1\.\s", text) is not None
 
     def _build_title(self, text: str) -> str:
         trimmed = text.strip()
@@ -174,12 +243,23 @@ class DigestService:
 
     def _build_item_summary(self, text: str) -> str:
         cleaned = " ".join(text.split()).strip()
-        if len(cleaned) <= 180:
-            return cleaned
-        return f"{cleaned[:177].rstrip()}..."
+        if not cleaned:
+            return "Подробностей в посте почти нет."
+
+        sentence_candidates = re.split(r"(?<=[.!?])\s+", cleaned)
+        summary = " ".join(part.strip() for part in sentence_candidates[:2] if part.strip())
+        if not summary:
+            summary = cleaned
+        if len(summary) <= MAX_DIGEST_SUMMARY_LENGTH:
+            return summary
+        return f"{summary[: MAX_DIGEST_SUMMARY_LENGTH - 3].rstrip()}..."
 
 
 def _coerce_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _contains_cjk(value: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in value)

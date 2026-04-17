@@ -1,5 +1,40 @@
 # Evolution Log
 
+---
+
+## [2026-04-17 12:40] User-added public channels + bot UX cleanup
+### Current state
+- User-added public Telegram channels are already supported through the existing Telethon validation layer.
+- `/channels` now shows two explicit sections: curated channels first, then user-added channels for the current user.
+- User-added channels can be toggled on and off from the same bot view, and they can be removed from the personal list without touching curated catalog data.
+- Topics are no longer exposed in the main bot UX because the flow is premature and adds confusion.
+- Digest generation now uses a stricter Russian-only prompt contract with a stable compact format and fallback validation.
+
+### Decisions made
+- Kept the modular monolith and current persistence model; no topic/schema rewrite was introduced for this cleanup.
+- Preserved curated catalog behavior and separated user-added sources only at the bot presentation layer.
+- Left topic data structures in place, but removed Topics from the reply keyboard and help text instead of expanding the flow.
+- Strengthened the LLM prompt with explicit language control, format requirements, and top-N output limits instead of changing ingest.
+
+### Problems / blockers
+- If the LLM is disabled entirely, fallback formatting stays stable but cannot fully translate mixed-language source text into Russian.
+- Old hidden `/topics` handlers still exist for compatibility, but they are intentionally not part of the main UX anymore.
+- User-added channel removal currently removes the current user's subscription entry, not the shared channel row from the database.
+
+### Files changed
+- `app/bot/handlers/start.py`
+- `app/services/digest_service.py`
+- `app/services/llm.py`
+- `app/services/user_channel_service.py`
+- `tests/test_mvp_slice.py`
+- `docs/Evolution.md`
+
+### Next step
+- Implement digest window selection (`1d` / `3d` / `7d`) and polish ranking/top-N behavior on top of the current stable Telegram-first flow.
+
+### Prompt handoff
+The working MVP now supports curated channels plus user-added public channels validated via Telethon. Bot UX was cleaned up so `/channels` clearly separates curated sources from personal sources, Topics were removed from the visible bot flow, and digest prompting was tightened to produce a more stable Russian-only summary format. The next narrow slice should focus on digest window control (`1d/3d/7d`) and ranking/top-N polish without rewriting architecture, adding RAG, or expanding topic management.
+
 Этот файл нужен как краткая память проекта.
 Его задача - фиксировать текущее состояние, решения, проблемы и следующий шаг так, чтобы новый чат или новый агент мог быстро продолжить работу без потери контекста.
 

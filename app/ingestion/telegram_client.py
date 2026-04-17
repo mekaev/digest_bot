@@ -1,15 +1,29 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+import re
 from typing import Any
+from urllib.parse import urlparse
 
 from telethon import TelegramClient
+from telethon.errors import ChannelPrivateError, UsernameInvalidError, UsernameNotOccupiedError
+from telethon.tl import types
 
 from app.config import BASE_DIR, get_settings
 
 
 class IngestionConfigurationError(RuntimeError):
     pass
+
+
+class ChannelValidationError(ValueError):
+    pass
+
+
+@dataclass(slots=True)
+class TelegramChannel:
+    telegram_handle: str
+    title: str
+    description: str
 
 
 @dataclass(slots=True)
@@ -52,6 +66,71 @@ class TelegramIngestionClient:
             channel_handle=channel.lstrip("@"),
             published_at=published_at,
             source_url=self._build_source_url(channel, message_id),
+        )
+
+    async def validate_public_channel(
+        self,
+        channel_reference: str,
+        allow_login: bool = False,
+    ) -> TelegramChannel:
+        normalized_handle = normalize_channel_reference(channel_reference)
+        if not normalized_handle:
+            raise ChannelValidationError(
+                "Send a public channel as @username or https://t.me/username."
+            )
+
+        if not self.is_configured():
+            raise IngestionConfigurationError(
+                "Telethon ingestion is not configured. Set TELEGRAM_API_ID and TELEGRAM_API_HASH."
+            )
+
+        async with TelegramClient(str(self.session_path), self.api_id, self.api_hash) as client:
+            if allow_login:
+                if not self.phone:
+                    raise IngestionConfigurationError(
+                        "TELEGRAM_PHONE is required for the first Telethon authorization."
+                    )
+                await client.start(phone=self.phone)
+            else:
+                await client.connect()
+                if not await client.is_user_authorized():
+                    raise IngestionConfigurationError(
+                        "Telethon session is not authorized. Run scripts/ingest_once.py first."
+                    )
+
+            try:
+                entity = await client.get_entity(normalized_handle)
+            except UsernameInvalidError as exc:
+                raise ChannelValidationError(
+                    "Send a valid public channel as @username or https://t.me/username."
+                ) from exc
+            except UsernameNotOccupiedError as exc:
+                raise ChannelValidationError(
+                    f"Channel @{normalized_handle} was not found or is unavailable."
+                ) from exc
+            except ChannelPrivateError as exc:
+                raise ChannelValidationError(
+                    "Private channels are not supported. Add a public channel instead."
+                ) from exc
+            except ValueError as exc:
+                raise ChannelValidationError(
+                    f"Channel @{normalized_handle} was not found or is unavailable."
+                ) from exc
+
+        if not isinstance(entity, types.Channel):
+            raise ChannelValidationError("Only public Telegram channels are supported.")
+
+        public_handle = (getattr(entity, "username", "") or "").strip().lower()
+        if not public_handle:
+            raise ChannelValidationError(
+                "Only public channels with a visible @username are supported."
+            )
+
+        title = (getattr(entity, "title", "") or public_handle).strip() or public_handle
+        return TelegramChannel(
+            telegram_handle=public_handle,
+            title=title,
+            description="",
         )
 
     async def fetch_messages(
@@ -104,3 +183,29 @@ class TelegramIngestionClient:
 
 def _clean_text(value: str) -> str:
     return " ".join(value.split()).strip()
+
+
+def normalize_channel_reference(value: str) -> str:
+    raw_value = value.strip()
+    if not raw_value:
+        return ""
+
+    if raw_value.startswith("@"):
+        handle = raw_value[1:].strip().lower()
+        return handle if _is_valid_public_handle(handle) else ""
+
+    parsed = urlparse(raw_value)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return ""
+    if parsed.netloc.lower() not in {"t.me", "www.t.me"}:
+        return ""
+
+    path = parsed.path.strip("/")
+    if not path or "/" in path:
+        return ""
+    handle = path.lower()
+    return handle if _is_valid_public_handle(handle) else ""
+
+
+def _is_valid_public_handle(value: str) -> bool:
+    return bool(re.fullmatch(r"[a-z][a-z0-9_]{3,31}", value))

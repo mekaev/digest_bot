@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.db.models import Channel, Topic
 
 SEED_PATH = Path(__file__).resolve().parent.parent / "catalog_seed.json"
+USER_ADDED_TOPIC_SLUG = "user-added"
 
 
 class CatalogService:
@@ -46,6 +47,8 @@ class CatalogService:
                     title=channel_payload["title"],
                     description=channel_payload.get("description", ""),
                     is_active=True,
+                    is_user_added=False,
+                    added_by_user_id=None,
                 )
                 self.session.add(channel)
             else:
@@ -53,15 +56,24 @@ class CatalogService:
                 channel.title = channel_payload["title"]
                 channel.description = channel_payload.get("description", "")
                 channel.is_active = True
+                channel.is_user_added = False
+                channel.added_by_user_id = None
 
         self.session.commit()
 
     def list_topics(self) -> list[Topic]:
-        statement = select(Topic).order_by(Topic.name.asc())
+        statement = (
+            select(Topic)
+            .where(Topic.slug != USER_ADDED_TOPIC_SLUG)
+            .order_by(Topic.name.asc())
+        )
         return list(self.session.scalars(statement))
 
     def list_channels(self, topic_id: int | None = None) -> list[Channel]:
-        statement = select(Channel).where(Channel.is_active.is_(True))
+        statement = select(Channel).where(
+            Channel.is_active.is_(True),
+            Channel.is_user_added.is_(False),
+        )
         if topic_id is not None:
             statement = statement.where(Channel.topic_id == topic_id)
         statement = statement.order_by(Channel.title.asc())
