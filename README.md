@@ -54,6 +54,14 @@ API health check: `GET /health`
 - `/app/assistant` answers follow-up questions over the logged-in user's own enabled channels and saved digests, with citations.
 - If Together AI is disabled or unavailable, the assistant falls back to a deterministic snippet-based answer so the MVP remains demoable.
 
+## Admin analytics
+
+- Set `ADMIN_TELEGRAM_USER_IDS` in `.env` to a comma-separated list of Telegram user ids, for example `ADMIN_TELEGRAM_USER_IDS=123456789`.
+- Log in through the normal `/login` link-code flow, then open `/admin/analytics`.
+- The dashboard shows usage KPIs, daily event volume, recent events, and an activation funnel.
+- Funnel steps are based on persisted events: `signup_completed`, `telegram_linked`, `channels_selected`, `digest_schedule_created`, `first_digest_generated`, `first_digest_opened`, and `first_rag_query`.
+- Events are stored in SQLite in `analytics_events`; aggregates are computed on read for the MVP.
+
 ## Telegram voice questions
 
 - Send a Telegram voice message to the bot to ask the assistant about stored posts from your enabled user-added channels.

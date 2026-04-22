@@ -301,6 +301,51 @@
             padding: 22px 24px 0;
         }
 
+        .table-wrap {
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th,
+        td {
+            padding: 12px 14px;
+            border-top: 1px solid var(--border);
+            text-align: left;
+            vertical-align: top;
+        }
+
+        th {
+            color: var(--text-soft);
+            font-size: 0.9rem;
+            font-weight: 700;
+        }
+
+        .bar-track {
+            width: 100%;
+            min-width: 120px;
+            height: 10px;
+            border-radius: 999px;
+            background: #e7edff;
+            overflow: hidden;
+        }
+
+        .bar-fill {
+            height: 100%;
+            border-radius: inherit;
+            background: var(--accent);
+        }
+
+        .payload {
+            max-width: 360px;
+            overflow-wrap: anywhere;
+            color: var(--text-soft);
+            font-size: 0.9rem;
+        }
+
         @media (max-width: 720px) {
             .hero,
             .card {
@@ -331,6 +376,9 @@
                     <a href="/app/assistant">Assistant</a>
                     <a href="/app/digests">Digests</a>
                     <a href="/app/subscriptions">Subscriptions</a>
+                    {% if is_admin %}
+                        <a href="/admin/analytics">Admin</a>
+                    {% endif %}
                 {% else %}
                     <a href="/login">Login</a>
                 {% endif %}

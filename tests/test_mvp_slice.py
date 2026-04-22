@@ -11,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 
 os.environ.setdefault("BOT_TOKEN", "123456:TESTTOKEN")
 
+from app.analytics.events import AnalyticsService
 from app.bot.handlers import start as bot_start
 from app.bot.handlers.start import (
     MAIN_KEYBOARD,
@@ -20,7 +21,7 @@ from app.bot.handlers.start import (
 )
 from app.config import get_settings
 from app.db.base import Base
-from app.db.models import Channel, Digest, DigestItem, Post, Subscription, TelegramLinkCode, Topic
+from app.db.models import AnalyticsEvent, Channel, Digest, DigestItem, Post, Subscription, TelegramLinkCode, Topic
 from app.db.session import SessionLocal, configure_database
 from app.ingestion.service import IngestionService
 from app.ingestion.telegram_client import (
@@ -219,6 +220,7 @@ class MVPSliceTests(SessionTestMixin, unittest.TestCase):
             "ingestion_runs",
             "digests",
             "digest_items",
+            "analytics_events",
         }
         self.assertTrue(expected.issubset(tables))
         channel_columns = {column["name"] for column in inspector.get_columns("channels")}
@@ -229,6 +231,60 @@ class MVPSliceTests(SessionTestMixin, unittest.TestCase):
         self.assertTrue(
             {"views_count", "reactions_count", "forwards_count", "comments_count"}.issubset(post_columns)
         )
+        event_columns = {column["name"] for column in inspector.get_columns("analytics_events")}
+        self.assertTrue(
+            {"name", "user_id", "source", "payload_json", "occurred_at"}.issubset(event_columns)
+        )
+
+    def test_analytics_events_persist_and_dashboard_counts_usage(self) -> None:
+        session, _engine = self.make_session()
+        user = UserService(session).upsert_telegram_user(
+            telegram_user_id=43,
+            username="analytics",
+            display_name="Analytics User",
+        )
+
+        service = AnalyticsService(session)
+        event = service.track(
+            "signup_completed",
+            user_id=user.id,
+            source="web",
+            payload={"next": "/app"},
+        )
+        stored_event = session.get(AnalyticsEvent, event.id)
+        dashboard = service.get_dashboard(period_days=30)
+
+        self.assertIsNotNone(stored_event)
+        self.assertEqual(stored_event.name, "signup_completed")
+        self.assertEqual(stored_event.source, "web")
+        self.assertIn('"next": "/app"', stored_event.payload_json)
+        self.assertEqual({metric.label: metric.value for metric in dashboard.kpis}["Users"], 1)
+        self.assertEqual({metric.label: metric.value for metric in dashboard.kpis}["Active users"], 1)
+        self.assertTrue(any(step.event_name == "signup_completed" for step in dashboard.funnel_steps))
+
+    def test_analytics_track_once_deduplicates_first_events(self) -> None:
+        session, _engine = self.make_session()
+        user = UserService(session).upsert_telegram_user(
+            telegram_user_id=44,
+            username="once",
+            display_name="Once User",
+        )
+        service = AnalyticsService(session)
+
+        first = service.track_once("first_rag_query", user_id=user.id, source="web")
+        second = service.track_once("first_rag_query", user_id=user.id, source="web")
+        events = list(
+            session.scalars(
+                select(AnalyticsEvent).where(
+                    AnalyticsEvent.name == "first_rag_query",
+                    AnalyticsEvent.user_id == user.id,
+                )
+            )
+        )
+
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+        self.assertEqual(len(events), 1)
 
     def test_link_code_is_reused_and_unknown_channel_is_rejected(self) -> None:
         session, _engine = self.make_session()
@@ -660,6 +716,8 @@ class BotAddChannelFlowTests(SessionTestMixin, unittest.IsolatedAsyncioTestCase)
         self.assertEqual(call_log, ["@publicsource"])
         self.assertTrue(state.cleared)
         self.assertEqual(len(message.answers), 1)
+        event_names = [event.name for event in session.scalars(select(AnalyticsEvent))]
+        self.assertIn("channels_selected", event_names)
         self.assertIn("@publicsource", message.answers[0]["text"])
         self.assertIn("added and enabled", message.answers[0]["text"])
 
@@ -804,6 +862,10 @@ class BotVoiceFlowTests(SessionTestMixin, unittest.IsolatedAsyncioTestCase):
         self.assertIn("What did OpenAI publish?", message.answers[1]["text"])
         self.assertIn("OpenAI published an MCP update [1].", message.answers[1]["text"])
         self.assertIn("https://t.me/openaifeed/1", message.answers[1]["text"])
+        event_names = [event.name for event in session.scalars(select(AnalyticsEvent))]
+        self.assertIn("voice_query_transcribed", event_names)
+        self.assertIn("rag_query", event_names)
+        self.assertIn("first_rag_query", event_names)
 
     async def test_voice_message_returns_stt_error_without_crash(self) -> None:
         session, _engine = self.make_session()
@@ -871,6 +933,10 @@ class BotVoiceFlowTests(SessionTestMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(message.answers), 1)
         self.assertIn("эти новости не про google", message.answers[0]["text"])
         self.assertIn("Недостаточно данных по google.", message.answers[0]["text"])
+
+        event_names = [event.name for event in session.scalars(select(AnalyticsEvent))]
+        self.assertIn("rag_query", event_names)
+        self.assertIn("first_rag_query", event_names)
 
     async def test_reserved_text_messages_are_not_answered_by_assistant(self) -> None:
         session, _engine = self.make_session()
@@ -1657,7 +1723,7 @@ class WebSurfaceTests(SessionTestMixin, unittest.TestCase):
     def test_protected_pages_redirect_without_session(self) -> None:
         client = self.make_web_client()
 
-        for path in ("/app", "/app/assistant", "/app/digests", "/app/subscriptions"):
+        for path in ("/app", "/app/assistant", "/app/digests", "/app/subscriptions", "/admin/analytics"):
             with self.subTest(path=path):
                 response = client.get(path, follow_redirects=False)
                 self.assertEqual(response.status_code, 303)
@@ -1674,6 +1740,54 @@ class WebSurfaceTests(SessionTestMixin, unittest.TestCase):
 
         self.assertEqual(response.status_code, 303)
         self.assertTrue(response.headers["location"].startswith("/login?next="))
+
+    def test_admin_analytics_rejects_non_admin_user(self) -> None:
+        with patch.dict(os.environ, {"ADMIN_TELEGRAM_USER_IDS": ""}):
+            get_settings.cache_clear()
+            try:
+                client = self.make_web_client()
+                _user_id, _code_id, link_code = self.create_user_with_code(
+                    telegram_user_id=409,
+                    username="notadmin",
+                    display_name="Not Admin",
+                )
+
+                self.redeem_code(client, link_code)
+                response = client.get("/admin/analytics")
+
+                self.assertEqual(response.status_code, 403)
+            finally:
+                get_settings.cache_clear()
+
+    def test_admin_analytics_page_renders_for_whitelisted_user(self) -> None:
+        with patch.dict(os.environ, {"ADMIN_TELEGRAM_USER_IDS": "410"}):
+            get_settings.cache_clear()
+            try:
+                client = self.make_web_client()
+                user_id, _code_id, link_code = self.create_user_with_code(
+                    telegram_user_id=410,
+                    username="admin",
+                    display_name="Admin User",
+                )
+                self.redeem_code(client, link_code)
+                with SessionLocal() as session:
+                    AnalyticsService(session).track(
+                        "channels_selected",
+                        user_id=user_id,
+                        source="web",
+                        payload={"channel_id": 1},
+                    )
+
+                response = client.get("/admin/analytics")
+
+                self.assertEqual(response.status_code, 200)
+                self.assertIn("Usage dashboard", response.text)
+                self.assertIn("Activation funnel", response.text)
+                self.assertIn("Web login completed", response.text)
+                self.assertIn("Recent events", response.text)
+                self.assertIn("Admin", response.text)
+            finally:
+                get_settings.cache_clear()
 
     def test_valid_link_code_redeem_sets_session_and_marks_code_used(self) -> None:
         client = self.make_web_client()
@@ -1692,6 +1806,13 @@ class WebSurfaceTests(SessionTestMixin, unittest.TestCase):
         with SessionLocal() as session:
             redeemed_code = session.get(TelegramLinkCode, link_code_id)
             self.assertIsNotNone(redeemed_code.used_at)
+            event = session.scalar(
+                select(AnalyticsEvent).where(
+                    AnalyticsEvent.name == "signup_completed",
+                    AnalyticsEvent.user_id == _user_id,
+                )
+            )
+            self.assertIsNotNone(event)
 
     def test_invalid_expired_and_used_codes_render_login_error(self) -> None:
         client = self.make_web_client()
@@ -1794,6 +1915,14 @@ class WebSurfaceTests(SessionTestMixin, unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("Visible digest for current user", response.text)
         self.assertNotIn("Hidden digest for other user", response.text)
+        with SessionLocal() as session:
+            event = session.scalar(
+                select(AnalyticsEvent).where(
+                    AnalyticsEvent.name == "first_digest_opened",
+                    AnalyticsEvent.user_id == user_id,
+                )
+            )
+            self.assertIsNotNone(event)
 
     def test_subscriptions_page_renders_and_updates_user_subscriptions(self) -> None:
         client = self.make_web_client()
@@ -1833,6 +1962,13 @@ class WebSurfaceTests(SessionTestMixin, unittest.TestCase):
             )
             self.assertIsNotNone(subscription)
             self.assertTrue(subscription.enabled)
+            event = session.scalar(
+                select(AnalyticsEvent).where(
+                    AnalyticsEvent.name == "channels_selected",
+                    AnalyticsEvent.user_id == user_id,
+                )
+            )
+            self.assertIsNotNone(event)
 
     def test_assistant_page_loads_and_ask_returns_citations(self) -> None:
         client = self.make_web_client()
@@ -1872,6 +2008,15 @@ class WebSurfaceTests(SessionTestMixin, unittest.TestCase):
         self.assertIn("[1]", ask_response.text)
         self.assertIn("Источники", ask_response.text)
         self.assertIn("https://t.me/assistantfeed/1201", ask_response.text)
+        with SessionLocal() as session:
+            event_names = [
+                event.name
+                for event in session.scalars(
+                    select(AnalyticsEvent).where(AnalyticsEvent.user_id == user_id)
+                )
+            ]
+            self.assertIn("rag_query", event_names)
+            self.assertIn("first_rag_query", event_names)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="card">
+    <div class="meta">
+        <span class="badge success">admin</span>
+        <span>Period: last {{ dashboard.period_days }} days</span>
+        <a href="/admin/analytics?period_days=7">7 days</a>
+        <a href="/admin/analytics?period_days=30">30 days</a>
+    </div>
+    <h1>Usage dashboard</h1>
+    <p>Internal MVP analytics from persisted product events and current database state.</p>
+</section>
+
+<section class="card">
+    <h2>Key metrics</h2>
+    <div class="grid two">
+        {% for metric in dashboard.kpis %}
+            <div class="metric">
+                <strong>{{ metric.value }}</strong>
+                {{ metric.label }}
+                {% if metric.helper %}
+                    <div class="helper-text">{{ metric.helper }}</div>
+                {% endif %}
+            </div>
+        {% endfor %}
+    </div>
+</section>
+
+<section class="card">
+    <h2>Activation funnel</h2>
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Step</th>
+                    <th>Users</th>
+                    <th>Conversion</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for step in dashboard.funnel_steps %}
+                    <tr>
+                        <td>
+                            <strong>{{ step.label }}</strong>
+                            <div class="helper-text">{{ step.event_name }}</div>
+                        </td>
+                        <td>{{ step.users_count }}</td>
+                        <td>{{ "%.1f"|format(step.conversion_percent) }}%</td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+
+<section class="card">
+    <h2>Daily usage</h2>
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Day</th>
+                    <th>Events</th>
+                    <th>Active users</th>
+                    <th>Volume</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for day in dashboard.daily_usage %}
+                    <tr>
+                        <td>{{ day.day }}</td>
+                        <td>{{ day.events_count }}</td>
+                        <td>{{ day.active_users }}</td>
+                        <td>
+                            <div class="bar-track">
+                                <div
+                                    class="bar-fill"
+                                    style="width: {{ (day.events_count / dashboard.max_daily_events * 100) if dashboard.max_daily_events else 0 }}%;"
+                                ></div>
+                            </div>
+                        </td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+
+<section class="card">
+    <h2>Recent events</h2>
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Name</th>
+                    <th>User</th>
+                    <th>Source</th>
+                    <th>Payload</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for event in dashboard.recent_events %}
+                    <tr>
+                        <td>{{ event.occurred_at_text }}</td>
+                        <td>{{ event.name }}</td>
+                        <td>{{ event.user_id if event.user_id is not none else "-" }}</td>
+                        <td>{{ event.source }}</td>
+                        <td class="payload">{{ event.payload_text }}</td>
+                    </tr>
+                {% else %}
+                    <tr>
+                        <td colspan="5">No events stored yet.</td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+{% endblock %}

@@ -6,6 +6,8 @@ from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
+from app.analytics.events import AnalyticsService
+from app.config import get_settings
 from app.db.models import User
 from app.db.session import SessionLocal
 from app.rag.qa import QAResponse, QAService
@@ -23,12 +25,19 @@ templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent.parent
 async def landing_page(request: Request) -> HTMLResponse:
     with SessionLocal() as session:
         current_user = _get_current_user(request, session)
+        AnalyticsService(session).track(
+            "landing_view",
+            user_id=current_user.id if current_user is not None else None,
+            source="web",
+            payload={"path": "/"},
+        )
 
     return templates.TemplateResponse(
         request=request,
         name="landing.html",
         context={
             "current_user": current_user,
+            "is_admin": _is_admin_user(current_user),
             "page_title": "AI Telegram Digest Bot",
         },
     )
@@ -43,6 +52,11 @@ async def login_page(request: Request) -> Response:
         current_user = _get_current_user(request, session)
         if current_user is not None:
             return RedirectResponse(url=next_path, status_code=status.HTTP_303_SEE_OTHER)
+        AnalyticsService(session).track(
+            "signup_started",
+            source="web",
+            payload={"next": next_path},
+        )
 
     return _render_login_page(request, code=code_value, next_path=next_path)
 
@@ -65,6 +79,12 @@ async def redeem_link_code(request: Request) -> Response:
                 next_path=next_path,
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
+        AnalyticsService(session).track(
+            "signup_completed",
+            user_id=user.id,
+            source="web",
+            payload={"next": next_path},
+        )
 
     request.session.clear()
     request.session["user_id"] = user.id
@@ -86,6 +106,7 @@ async def app_profile_page(request: Request) -> Response:
         name="app_profile.html",
         context={
             "current_user": current_user,
+            "is_admin": _is_admin_user(current_user),
             "subscribed_channels": subscribed_channels,
             "recent_digests": recent_digests,
             "page_title": "Profile",
@@ -101,12 +122,20 @@ async def app_digests_page(request: Request) -> Response:
             return _redirect_to_login(request)
 
         digests = DigestService(session).list_digests_for_user(current_user.id)
+        if digests:
+            AnalyticsService(session).track_once(
+                "first_digest_opened",
+                user_id=current_user.id,
+                source="web",
+                payload={"digest_id": digests[0].id},
+            )
 
     return templates.TemplateResponse(
         request=request,
         name="app_digests.html",
         context={
             "current_user": current_user,
+            "is_admin": _is_admin_user(current_user),
             "digests": digests,
             "page_title": "Digests",
         },
@@ -127,6 +156,7 @@ async def app_subscriptions_page(request: Request) -> Response:
         name="app_subscriptions.html",
         context={
             "current_user": current_user,
+            "is_admin": _is_admin_user(current_user),
             "topic_sections": topic_sections,
             "page_title": "Subscriptions",
         },
@@ -178,6 +208,23 @@ async def ask_assistant(request: Request) -> Response:
             question=question,
             window_days=selected_window_days,
         )
+        analytics = AnalyticsService(session)
+        analytics.track(
+            "rag_query",
+            user_id=current_user.id,
+            source="web",
+            payload={
+                "window_days": assistant_result.window_days,
+                "sources_count": len(assistant_result.sources),
+                "used_fallback": assistant_result.used_fallback,
+            },
+        )
+        analytics.track_once(
+            "first_rag_query",
+            user_id=current_user.id,
+            source="web",
+            payload={"window_days": assistant_result.window_days},
+        )
 
     return _render_assistant_page(
         request=request,
@@ -200,17 +247,49 @@ async def update_subscription(request: Request, channel_id: int) -> RedirectResp
         service = SubscriptionService(session)
         try:
             if enabled_raw is None:
-                service.toggle_subscription(current_user.id, channel_id)
+                subscription = service.toggle_subscription(current_user.id, channel_id)
             else:
-                service.set_subscription(
+                subscription = service.set_subscription(
                     current_user.id,
                     channel_id,
                     enabled=_parse_enabled_flag(str(enabled_raw)),
                 )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        else:
+            if subscription.enabled:
+                AnalyticsService(session).track(
+                    "channels_selected",
+                    user_id=current_user.id,
+                    source="web",
+                    payload={"channel_id": channel_id},
+                )
 
     return RedirectResponse(url="/app/subscriptions", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@router.get("/admin/analytics", response_class=HTMLResponse)
+async def admin_analytics_page(request: Request) -> Response:
+    period_days = _parse_admin_period_days(str(request.query_params.get("period_days", "30")))
+    with SessionLocal() as session:
+        current_user = _get_current_user(request, session)
+        if current_user is None:
+            return _redirect_to_login(request)
+        if not _is_admin_user(current_user):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required.")
+
+        dashboard = AnalyticsService(session).get_dashboard(period_days=period_days)
+
+    return templates.TemplateResponse(
+        request=request,
+        name="admin_analytics.html",
+        context={
+            "current_user": current_user,
+            "is_admin": True,
+            "dashboard": dashboard,
+            "page_title": "Admin analytics",
+        },
+    )
 
 
 def _build_subscription_sections(session, user_id: int) -> list[dict]:
@@ -278,6 +357,7 @@ def _render_login_page(
         name="login.html",
         context={
             "current_user": None,
+            "is_admin": False,
             "error_message": error_message,
             "code": code,
             "next_path": next_path,
@@ -301,6 +381,7 @@ def _render_assistant_page(
         name="app_assistant.html",
         context={
             "current_user": current_user,
+            "is_admin": _is_admin_user(current_user),
             "question": question,
             "selected_window_days": selected_window_days,
             "allowed_window_days": ALLOWED_DIGEST_WINDOW_DAYS,
@@ -316,6 +397,20 @@ def _safe_next_path(value: str) -> str:
     if value.startswith("/") and not value.startswith("//"):
         return value
     return "/app"
+
+
+def _is_admin_user(user: User | None) -> bool:
+    if user is None:
+        return False
+    return user.telegram_user_id in get_settings().admin_telegram_user_id_set
+
+
+def _parse_admin_period_days(value: str) -> int:
+    try:
+        period_days = int(value)
+    except (TypeError, ValueError):
+        return 30
+    return 7 if period_days == 7 else 30
 
 
 def _parse_enabled_flag(value: str) -> bool:
