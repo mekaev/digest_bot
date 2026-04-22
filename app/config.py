@@ -49,12 +49,26 @@ class Settings(BaseSettings):
     app_name: str = Field(default="AI Telegram Digest Bot", alias="APP_NAME")
     environment: str = Field(default="dev", alias="ENVIRONMENT")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    admin_telegram_user_ids: str = Field(default="", alias="ADMIN_TELEGRAM_USER_IDS")
 
     # Database
     database_url: str = Field(
         default="sqlite:///./data/digest.db",
         alias="DATABASE_URL",
     )
+
+    @property
+    def admin_telegram_user_id_set(self) -> set[int]:
+        user_ids: set[int] = set()
+        for raw_value in self.admin_telegram_user_ids.split(","):
+            value = raw_value.strip()
+            if not value:
+                continue
+            try:
+                user_ids.add(int(value))
+            except ValueError:
+                continue
+        return user_ids
 
 
 @lru_cache

@@ -2,6 +2,44 @@
 
 ---
 
+## [2026-04-22 15:30] MVP admin analytics dashboard
+### Current state
+- Added a protected server-rendered admin analytics page at `/admin/analytics`.
+- Admin access is restricted to logged-in users whose Telegram id is listed in `ADMIN_TELEGRAM_USER_IDS`.
+- Product events are now persisted in the SQLite-backed `analytics_events` table.
+- The dashboard shows KPI cards, daily event volume, activation funnel steps, and recent events.
+- Web and bot flows now track landing/login, Telegram link generation, channel selection, period selection, first digest generation/open, RAG queries, and voice transcription.
+
+### Decisions made
+- Kept analytics inside the modular monolith and existing FastAPI/Jinja UI.
+- Did not add PostHog, a role system, JavaScript charting, or materialized aggregate tables for the MVP.
+- Daily usage and funnel values are computed on read from persisted events and current DB state.
+
+### Problems / blockers
+- Events only start accumulating after this slice is deployed; older usage will not be reconstructed.
+- Funnel conversion is MVP-level and event-based, not a full cohort analytics engine.
+
+### Files changed
+- `app/db/models.py`
+- `app/analytics/events.py`
+- `app/api/routes/web.py`
+- `app/api/templates/base.html`
+- `app/api/templates/admin_analytics.html`
+- `app/bot/handlers/start.py`
+- `app/config.py`
+- `.env.example`
+- `README.md`
+- `tests/test_mvp_slice.py`
+- `docs/Evolution.md`
+
+### Next step
+- Use `/admin/analytics` in the demo after running through the user journey once so the event table contains a visible funnel.
+
+### Prompt handoff
+The MVP now has an internal analytics dashboard. Preserve the DB-backed `AnalyticsService` and the `ADMIN_TELEGRAM_USER_IDS` whitelist; future analytics work should extend event coverage or dashboard aggregates instead of adding a separate analytics stack.
+
+---
+
 ## [2026-04-22 14:40] Telegram assistant follow-ups and anchored RAG filtering
 ### Current state
 - Telegram bot now answers ordinary text questions as assistant queries, not only voice messages.

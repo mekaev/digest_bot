@@ -15,6 +15,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
+from app.analytics.events import AnalyticsService
 from app.db.session import SessionLocal
 from app.ingestion.telegram_client import ChannelValidationError, IngestionConfigurationError
 from app.ingestion.service import IngestionService
@@ -93,6 +94,12 @@ async def link_handler(message: Message) -> None:
             display_name=message.from_user.full_name,
         )
         link_code = service.get_or_create_link_code(user.id)
+        AnalyticsService(session).track(
+            "telegram_linked",
+            user_id=user.id,
+            source="bot",
+            payload={"link_code_id": link_code.id},
+        )
 
     expires_at = link_code.expires_at.strftime("%Y-%m-%d %H:%M UTC")
     await message.answer(
@@ -184,6 +191,12 @@ async def digest_handler(message: Message) -> None:
         )
         result = DigestService(session).generate_digest_for_user(user.id)
         if result.digest is not None:
+            AnalyticsService(session).track_once(
+                "first_digest_generated",
+                user_id=user.id,
+                source="bot",
+                payload={"digest_id": result.digest.id},
+            )
             DigestService(session).mark_delivered(result.digest.id)
 
     failure_note = _build_ingestion_note(ingestion_runs)
@@ -235,6 +248,19 @@ async def voice_message_handler(message: Message, bot: Bot) -> None:
             reply_markup=MAIN_KEYBOARD,
         )
         return
+
+    with SessionLocal() as session:
+        user = UserService(session).upsert_telegram_user(
+            telegram_user_id=message.from_user.id,
+            username=message.from_user.username or "",
+            display_name=message.from_user.full_name,
+        )
+        AnalyticsService(session).track(
+            "voice_query_transcribed",
+            user_id=user.id,
+            source="bot",
+            payload={"transcript_length": len(transcript)},
+        )
 
     await _answer_assistant_question(
         message=message,
@@ -338,6 +364,13 @@ async def toggle_subscription_callback(callback: CallbackQuery) -> None:
         except ValueError as exc:
             await callback.answer(str(exc), show_alert=True)
             return
+        if subscription.enabled:
+            AnalyticsService(session).track(
+                "channels_selected",
+                user_id=user.id,
+                source="bot",
+                payload={"channel_id": channel_id, "action": "toggle"},
+            )
         text, markup = _build_channels_view(session, user.id)
 
     state_text = "enabled" if subscription.enabled else "disabled"
@@ -390,6 +423,12 @@ async def set_period_callback(callback: CallbackQuery) -> None:
         except ValueError as exc:
             await callback.answer(str(exc), show_alert=True)
             return
+        AnalyticsService(session).track(
+            "digest_schedule_created",
+            user_id=user.id,
+            source="bot",
+            payload={"window_days": window_days},
+        )
         current_days = user_service.get_digest_window_days(user.id)
 
     await callback.message.edit_text(
@@ -536,6 +575,23 @@ async def _answer_assistant_question(
             question=normalized_question,
             window_days=window_days,
         )
+        analytics = AnalyticsService(session)
+        analytics.track(
+            "rag_query",
+            user_id=user.id,
+            source="bot",
+            payload={
+                "window_days": qa_response.window_days,
+                "sources_count": len(qa_response.sources),
+                "used_fallback": qa_response.used_fallback,
+            },
+        )
+        analytics.track_once(
+            "first_rag_query",
+            user_id=user.id,
+            source="bot",
+            payload={"window_days": qa_response.window_days},
+        )
 
     await message.answer(
         _build_assistant_answer_text(question_label, normalized_question, qa_response),
@@ -628,6 +684,16 @@ async def _handle_add_channel_submission(
         except IngestionConfigurationError as exc:
             await message.answer(str(exc), reply_markup=MAIN_KEYBOARD)
             return
+        AnalyticsService(session).track(
+            "channels_selected",
+            user_id=user.id,
+            source="bot",
+            payload={
+                "channel_id": result.channel.id,
+                "telegram_handle": result.channel.telegram_handle,
+                "channel_created": result.channel_created,
+            },
+        )
 
     await state.clear()
     await message.answer(_build_add_channel_success_text(result), reply_markup=MAIN_KEYBOARD)
