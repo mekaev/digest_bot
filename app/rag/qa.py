@@ -209,9 +209,15 @@ class QAService:
 
         sentences: list[str] = []
         if retrieval.weak_evidence:
-            sentences.append(
-                f"Данных за последние {retrieval.window_days} дн. недостаточно для уверенного ответа на вопрос «{question}»."
-            )
+            if retrieval.anchor_terms:
+                anchor_list = ", ".join(retrieval.anchor_terms)
+                sentences.append(
+                    f"Прямых данных по {anchor_list} за последние {retrieval.window_days} дн. недостаточно для уверенного ответа на вопрос «{question}»."
+                )
+            else:
+                sentences.append(
+                    f"Данных за последние {retrieval.window_days} дн. недостаточно для уверенного ответа на вопрос «{question}»."
+                )
             sentences.append("Ниже привожу ближайшие найденные упоминания без лишних выводов.")
         else:
             channel_list = ", ".join(distinct_channels[:3])

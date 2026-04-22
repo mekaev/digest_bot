@@ -14,6 +14,7 @@ from app.services.user_service import UserService
 MAX_SNIPPET_LENGTH = 220
 DEFAULT_TOP_K = 5
 MIN_RELEVANCE_SCORE = 0.35
+ANCHOR_WEAK_EVIDENCE_THRESHOLD = 0.9
 TOKEN_PATTERN = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+")
 STOPWORDS = {
     "a",
@@ -55,6 +56,18 @@ STOPWORDS = {
     "which",
     "who",
     "with",
+    "мне",
+    "нов",
+    "от",
+    "подробн",
+    "покаж",
+    "показал",
+    "продукт",
+    "расскаж",
+    "недел",
+    "эт",
+    "этой",
+    "вообщ",
     "за",
     "без",
     "было",
@@ -144,6 +157,30 @@ STOPWORDS = {
     "эту",
     "я",
 }
+BRAND_ANCHOR_TERMS = {
+    "ai",
+    "anthropic",
+    "apple",
+    "chatgpt",
+    "claude",
+    "copilot",
+    "cursor",
+    "deepseek",
+    "gemini",
+    "github",
+    "google",
+    "grok",
+    "kimi",
+    "llama",
+    "mcp",
+    "meta",
+    "microsoft",
+    "mistral",
+    "openai",
+    "perplexity",
+    "qwen",
+    "xai",
+}
 RUSSIAN_SUFFIXES = (
     "иями",
     "ями",
@@ -202,6 +239,7 @@ class RetrievalResult:
     query_terms: tuple[str, ...]
     evidence: list[RetrievedEvidence]
     weak_evidence: bool
+    anchor_terms: tuple[str, ...] = ()
 
 
 class SQLiteRAGRetriever:
@@ -218,6 +256,7 @@ class SQLiteRAGRetriever:
         normalized_question = " ".join(question.split()).strip()
         resolved_window_days = self._resolve_window_days(user_id, window_days)
         query_terms = tuple(_extract_query_terms(normalized_question))
+        anchor_terms = tuple(_extract_anchor_terms(query_terms))
         if not normalized_question or not query_terms:
             return RetrievalResult(
                 question=normalized_question,
@@ -225,6 +264,7 @@ class SQLiteRAGRetriever:
                 query_terms=query_terms,
                 evidence=[],
                 weak_evidence=True,
+                anchor_terms=anchor_terms,
             )
 
         accessible_channels = self._load_accessible_channels(user_id)
@@ -235,6 +275,7 @@ class SQLiteRAGRetriever:
                 query_terms=query_terms,
                 evidence=[],
                 weak_evidence=True,
+                anchor_terms=anchor_terms,
             )
 
         threshold = datetime.now(timezone.utc) - timedelta(days=resolved_window_days)
@@ -246,6 +287,7 @@ class SQLiteRAGRetriever:
                 query_terms=query_terms,
                 evidence=[],
                 weak_evidence=True,
+                anchor_terms=anchor_terms,
             )
 
         digest_hints = self._load_digest_hints(user_id, [post.id for post in posts])
@@ -260,6 +302,7 @@ class SQLiteRAGRetriever:
                 post=post,
                 channel=channel,
                 query_terms=query_terms,
+                anchor_terms=anchor_terms,
                 query_phrase=query_phrase,
                 window_days=resolved_window_days,
                 digest_hints=digest_hints.get(post.id, ()),
@@ -286,13 +329,15 @@ class SQLiteRAGRetriever:
             reverse=True,
         )
         evidence = scored_items[: max(limit, 1)]
-        weak_evidence = not evidence or evidence[0].score < 0.75
+        weak_threshold = ANCHOR_WEAK_EVIDENCE_THRESHOLD if anchor_terms else 0.75
+        weak_evidence = not evidence or evidence[0].score < weak_threshold
         return RetrievalResult(
             question=normalized_question,
             window_days=resolved_window_days,
             query_terms=query_terms,
             evidence=evidence,
             weak_evidence=weak_evidence,
+            anchor_terms=anchor_terms,
         )
 
     def _resolve_window_days(self, user_id: int, window_days: int | None) -> int:
@@ -356,6 +401,7 @@ class SQLiteRAGRetriever:
         post: Post,
         channel: Channel,
         query_terms: tuple[str, ...],
+        anchor_terms: tuple[str, ...],
         query_phrase: str,
         window_days: int,
         digest_hints: list[str] | tuple[str, ...],
@@ -372,6 +418,12 @@ class SQLiteRAGRetriever:
             digest_text = " ".join(digest_hints)
             digest_term_set = set(_extract_query_terms(digest_text))
             digest_phrase_match = bool(query_phrase and query_phrase in _normalize_text(digest_text))
+
+        anchor_term_set = set(anchor_terms)
+        if anchor_term_set and not (
+            anchor_term_set & (post_term_set | channel_term_set | digest_term_set)
+        ):
+            return 0.0, ()
 
         if not matched_terms and not (set(query_terms) & digest_term_set):
             return 0.0, ()
@@ -418,6 +470,10 @@ def _extract_query_terms(text: str) -> list[str]:
         seen.add(normalized)
         tokens.append(normalized)
     return tokens
+
+
+def _extract_anchor_terms(query_terms: tuple[str, ...] | list[str]) -> list[str]:
+    return [term for term in query_terms if term in BRAND_ANCHOR_TERMS]
 
 
 def _normalize_text(text: str) -> str:

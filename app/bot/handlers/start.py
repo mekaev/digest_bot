@@ -1,4 +1,8 @@
-from aiogram import F, Router
+import asyncio
+from pathlib import Path
+import tempfile
+
+from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -14,11 +18,16 @@ from aiogram.types import (
 from app.db.session import SessionLocal
 from app.ingestion.telegram_client import ChannelValidationError, IngestionConfigurationError
 from app.ingestion.service import IngestionService
+from app.rag.qa import QAResponse, QAService
 from app.services.digest_service import DigestService
+from app.services.stt import STTConfigurationError, STTService, STTTranscriptionError
 from app.services.user_channel_service import AddChannelResult, UserChannelService
 from app.services.user_service import ALLOWED_DIGEST_WINDOW_DAYS, UserService
 
 router = Router()
+
+MAX_VOICE_FILE_SIZE_BYTES = 20 * 1024 * 1024
+MAX_TELEGRAM_REPLY_LENGTH = 3900
 
 
 class AddChannelState(StatesGroup):
@@ -183,6 +192,55 @@ async def digest_handler(message: Message) -> None:
     if failure_note:
         message_text = f"{message_text}\n\n{failure_note}"
     await message.answer(f"{period_note}\n\n{message_text}", reply_markup=MAIN_KEYBOARD)
+
+
+@router.message(F.voice)
+async def voice_message_handler(message: Message, bot: Bot) -> None:
+    if message.from_user is None or message.voice is None:
+        return
+
+    voice_file_size = int(message.voice.file_size or 0)
+    if voice_file_size > MAX_VOICE_FILE_SIZE_BYTES:
+        await message.answer(
+            "Голосовое сообщение слишком большое. Отправьте более короткий вопрос.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    await message.answer("Голосовое получено. Распознаю речь...")
+
+    audio_path: Path | None = None
+    try:
+        audio_path = await _download_voice_message(message, bot)
+        transcript = await asyncio.to_thread(STTService().transcribe, audio_path)
+    except (STTConfigurationError, STTTranscriptionError, OSError) as exc:
+        await message.answer(
+            f"Не удалось распознать голосовое сообщение: {exc}",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+    except Exception as exc:  # noqa: BLE001
+        await message.answer(
+            f"Не удалось обработать голосовое сообщение: {exc}",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+    finally:
+        if audio_path is not None:
+            audio_path.unlink(missing_ok=True)
+
+    if not transcript.strip():
+        await message.answer(
+            "Распознавание вернуло пустой вопрос. Попробуйте записать голосовое еще раз.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    await _answer_assistant_question(
+        message=message,
+        question=transcript,
+        question_label="Распознанный вопрос:",
+    )
 
 
 @router.message(AddChannelState.waiting_for_channel)
@@ -375,6 +433,20 @@ async def digest_button_handler(message: Message) -> None:
     await digest_handler(message)
 
 
+@router.message(F.text)
+async def assistant_text_message_handler(message: Message) -> None:
+    if not message.text:
+        return
+    text = message.text.strip()
+    if not text or text.startswith("/") or text in _reserved_assistant_texts():
+        return
+    await _answer_assistant_question(
+        message=message,
+        question=text,
+        question_label="Вопрос:",
+    )
+
+
 def _build_channels_view(session, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     channel_entries = UserChannelService(session).list_user_added_channels(user_id)
     if not channel_entries:
@@ -432,6 +504,107 @@ def _build_ingestion_note(ingestion_runs: list) -> str:
     return f"Ingestion note: {failed_runs[0].error_message}"
 
 
+async def _answer_assistant_question(
+    message: Message,
+    question: str,
+    question_label: str,
+) -> None:
+    if message.from_user is None:
+        return
+
+    normalized_question = " ".join(question.split()).strip()
+    if not normalized_question:
+        await message.answer(
+            "Вопрос пустой. Отправьте текст или голосовое сообщение с вопросом.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    with SessionLocal() as session:
+        user_service = UserService(session)
+        user = user_service.get_by_telegram_user_id(message.from_user.id)
+        if user is None:
+            user = user_service.upsert_telegram_user(
+                telegram_user_id=message.from_user.id,
+                username=message.from_user.username or "",
+                display_name=message.from_user.full_name,
+            )
+
+        window_days = user_service.get_digest_window_days(user.id)
+        qa_response = QAService(session).answer(
+            user_id=user.id,
+            question=normalized_question,
+            window_days=window_days,
+        )
+
+    await message.answer(
+        _build_assistant_answer_text(question_label, normalized_question, qa_response),
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def _download_voice_message(message: Message, bot: Bot) -> Path:
+    if message.voice is None:
+        raise ValueError("Voice message is missing.")
+
+    temp_file = tempfile.NamedTemporaryFile(
+        prefix="telegram-voice-",
+        suffix=".ogg",
+        delete=False,
+    )
+    audio_path = Path(temp_file.name)
+    temp_file.close()
+
+    try:
+        await bot.download(message.voice.file_id, destination=audio_path)
+    except Exception:
+        audio_path.unlink(missing_ok=True)
+        raise
+    return audio_path
+
+
+def _build_assistant_answer_text(
+    question_label: str,
+    question: str,
+    qa_response: QAResponse,
+) -> str:
+    lines = [
+        question_label,
+        question,
+        "",
+        "Ответ по контексту ваших каналов:",
+        qa_response.answer_text,
+    ]
+    if qa_response.sources:
+        lines.extend(["", "Источники:"])
+        for source in qa_response.sources:
+            source_ref = source.source_url or source.source_label
+            lines.append(f"[{source.index}] {source.channel_name} - {source_ref}")
+
+    return _truncate_telegram_reply("\n".join(lines))
+
+
+def _build_voice_answer_text(transcript: str, qa_response: QAResponse) -> str:
+    return _build_assistant_answer_text("Распознанный вопрос:", transcript, qa_response)
+
+
+def _reserved_assistant_texts() -> set[str]:
+    return {
+        "Help",
+        "Link account",
+        "Channels",
+        "Add channel",
+        "Period",
+        "Digest",
+    }
+
+
+def _truncate_telegram_reply(text: str) -> str:
+    if len(text) <= MAX_TELEGRAM_REPLY_LENGTH:
+        return text
+    return f"{text[: MAX_TELEGRAM_REPLY_LENGTH - 3].rstrip()}..."
+
+
 async def _handle_add_channel_submission(
     message: Message,
     state: FSMContext,
@@ -477,7 +650,8 @@ def _build_help_text() -> str:
         "/channels - manage your user-added channels\n"
         "/addchannel - add a public Telegram channel by @username or t.me link\n"
         "/period - choose the digest period: 1, 3, or 7 days\n"
-        "/digest - fetch recent posts from your enabled channels and send the latest digest"
+        "/digest - fetch recent posts from your enabled channels and send the latest digest\n"
+        "Голосовое сообщение - задать ассистенту вопрос по сохраненному контексту каналов"
     )
 
 

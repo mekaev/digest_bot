@@ -31,7 +31,8 @@ from app.ingestion.telegram_client import (
     TelegramMessage,
     normalize_channel_reference,
 )
-from app.rag.qa import QAService
+from app.rag.qa import QAResponse, QASource, QAService
+from app.services.stt import STTConfigurationError, STTService
 from app.services.catalog_service import CatalogService
 from app.services.digest_service import DEFAULT_DIGEST_MAX_ITEMS, DIGEST_SYSTEM_PROMPT, DigestService
 from app.services.subscription_service import SubscriptionService
@@ -165,10 +166,24 @@ class DummyFromUser:
         self.full_name = full_name
 
 
+class DummyVoice:
+    def __init__(self, file_id: str = "voice-file-id", file_size: int = 1024) -> None:
+        self.file_id = file_id
+        self.file_size = file_size
+
+
 class DummyMessage:
-    def __init__(self, text: str, user_id: int = 9001, username: str = "botuser", full_name: str = "Bot User") -> None:
+    def __init__(
+        self,
+        text: str | None,
+        user_id: int = 9001,
+        username: str = "botuser",
+        full_name: str = "Bot User",
+        voice: DummyVoice | None = None,
+    ) -> None:
         self.text = text
         self.from_user = DummyFromUser(user_id=user_id, username=username, full_name=full_name)
+        self.voice = voice
         self.answers: list[dict[str, object]] = []
 
     async def answer(self, text: str, reply_markup=None) -> None:
@@ -500,6 +515,112 @@ class UserAddedChannelTests(SessionTestMixin, unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(list(session.scalars(select(Subscription))), [])
 
 
+class STTServiceTests(unittest.TestCase):
+    def make_audio_file(self) -> Path:
+        fd, raw_path = tempfile.mkstemp(prefix="stt-test-", suffix=".ogg")
+        os.close(fd)
+        path = Path(raw_path)
+        path.write_bytes(b"fake audio")
+        self.addCleanup(lambda: path.exists() and path.unlink())
+        return path
+
+    def test_stt_service_requires_api_key(self) -> None:
+        audio_path = self.make_audio_file()
+        service = STTService(api_key="", api_base_url="https://stt.example/v1")
+
+        with self.assertRaisesRegex(STTConfigurationError, "STT is not configured"):
+            service.transcribe(audio_path)
+
+    def test_stt_service_parses_whisper_compatible_response(self) -> None:
+        audio_path = self.make_audio_file()
+        calls = []
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"text": "  hello   world  "}'
+
+        def fake_urlopen(request, timeout: int):
+            calls.append((request, timeout))
+            return FakeResponse()
+
+        service = STTService(
+            api_key="test-key",
+            api_base_url="https://stt.example/v1",
+            model="whisper-test",
+            language="ru",
+            timeout_seconds=12,
+        )
+
+        with patch("app.services.stt.urlopen", new=fake_urlopen):
+            transcript = service.transcribe(audio_path)
+
+        self.assertEqual(transcript, "hello world")
+        self.assertEqual(calls[0][0].full_url, "https://stt.example/v1/audio/transcriptions")
+        self.assertEqual(calls[0][1], 12)
+
+    def test_stt_service_builds_together_transcription_request(self) -> None:
+        audio_path = self.make_audio_file()
+        calls = []
+
+        class FakeTranscriptionResponse:
+            text = "together transcript"
+
+        class FakeTranscriptions:
+            def create(self, **kwargs):
+                calls.append(("create", kwargs))
+                return FakeTranscriptionResponse()
+
+        class FakeAudio:
+            def __init__(self) -> None:
+                self.transcriptions = FakeTranscriptions()
+
+        class FakeTogether:
+            def __init__(self, **kwargs) -> None:
+                calls.append(("client", kwargs))
+                self.audio = FakeAudio()
+
+            def close(self) -> None:
+                calls.append(("close", {}))
+
+        service = STTService(
+            api_key="tgp_test_key",
+            api_base_url="https://api.together.ai/v1",
+            model="openai/whisper-large-v3",
+            language="ru",
+        )
+
+        with patch("app.services.stt.Together", new=FakeTogether):
+            transcript = service.transcribe(audio_path)
+
+        client_call = calls[0][1]
+        create_call = calls[1][1]
+
+        self.assertEqual(transcript, "together transcript")
+        self.assertEqual(client_call["api_key"], "tgp_test_key")
+        self.assertEqual(client_call["base_url"], "https://api.together.ai/v1")
+        self.assertEqual(Path(create_call["file"].name), audio_path)
+        self.assertFalse(isinstance(create_call["file"], str))
+        self.assertEqual(create_call["model"], "openai/whisper-large-v3")
+        self.assertEqual(create_call["language"], "ru")
+        self.assertEqual(create_call["response_format"], "json")
+        self.assertEqual(calls[-1][0], "close")
+
+    def test_stt_service_routes_together_key_away_from_openai_default(self) -> None:
+        service = STTService(
+            api_key="tgp_test_key",
+            api_base_url="https://api.openai.com/v1",
+            model="openai/whisper-large-v3",
+        )
+
+        self.assertEqual(service.api_base_url, "https://api.together.ai/v1")
+
+
 class BotAddChannelFlowTests(SessionTestMixin, unittest.IsolatedAsyncioTestCase):
     async def test_handle_add_channel_submission_succeeds_for_at_username_without_crash(self) -> None:
         session, _engine = self.make_session()
@@ -615,6 +736,159 @@ class BotAddChannelFlowTests(SessionTestMixin, unittest.IsolatedAsyncioTestCase)
         self.assertFalse(state.cleared)
         self.assertEqual(len(message.answers), 1)
         self.assertIn("scripts/ingest_once.py", message.answers[0]["text"])
+
+
+class BotVoiceFlowTests(SessionTestMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_voice_message_is_transcribed_and_answered_from_context(self) -> None:
+        session, _engine = self.make_session()
+        message = DummyMessage(
+            text=None,
+            user_id=9201,
+            username="voiceuser",
+            full_name="Voice User",
+            voice=DummyVoice(file_id="voice-123", file_size=2048),
+        )
+        fd, raw_path = tempfile.mkstemp(prefix="voice-handler-", suffix=".ogg")
+        os.close(fd)
+        audio_path = Path(raw_path)
+        audio_path.write_bytes(b"fake audio")
+        captured: dict[str, object] = {}
+
+        async def fake_download_voice_message(message_arg, bot_arg) -> Path:
+            captured["download_file_id"] = message_arg.voice.file_id
+            return audio_path
+
+        class FakeSTT:
+            def transcribe(self, audio_path_arg: Path) -> str:
+                captured["audio_path"] = audio_path_arg
+                return "What did OpenAI publish?"
+
+        class FakeQAService:
+            def __init__(self, session_arg) -> None:
+                captured["session"] = session_arg
+
+            def answer(self, user_id: int, question: str, window_days: int):
+                captured["qa_args"] = (user_id, question, window_days)
+                return QAResponse(
+                    question=question,
+                    window_days=window_days,
+                    answer_text="OpenAI published an MCP update [1].",
+                    sources=[
+                        QASource(
+                            index=1,
+                            channel_name="OpenAI Feed",
+                            published_at=datetime.now(timezone.utc),
+                            published_at_text="2026-04-22 10:00 UTC",
+                            source_url="https://t.me/openaifeed/1",
+                            source_label="OpenAI Feed / msg 1",
+                            snippet="OpenAI published an MCP update.",
+                        )
+                    ],
+                    used_fallback=False,
+                    weak_evidence=False,
+                )
+
+        with patch.object(bot_start, "SessionLocal", new=lambda: session):
+            with patch.object(bot_start, "_download_voice_message", new=fake_download_voice_message):
+                with patch.object(bot_start, "STTService", new=lambda: FakeSTT()):
+                    with patch.object(bot_start, "QAService", new=FakeQAService):
+                        await bot_start.voice_message_handler(message, object())
+
+        self.assertEqual(captured["download_file_id"], "voice-123")
+        self.assertEqual(captured["audio_path"], audio_path)
+        self.assertEqual(captured["qa_args"][1], "What did OpenAI publish?")
+        self.assertEqual(captured["qa_args"][2], DEFAULT_DIGEST_WINDOW_DAYS)
+        self.assertFalse(audio_path.exists())
+        self.assertEqual(len(message.answers), 2)
+        self.assertIn("Распознаю", message.answers[0]["text"])
+        self.assertIn("What did OpenAI publish?", message.answers[1]["text"])
+        self.assertIn("OpenAI published an MCP update [1].", message.answers[1]["text"])
+        self.assertIn("https://t.me/openaifeed/1", message.answers[1]["text"])
+
+    async def test_voice_message_returns_stt_error_without_crash(self) -> None:
+        session, _engine = self.make_session()
+        message = DummyMessage(
+            text=None,
+            user_id=9202,
+            username="nostt",
+            full_name="No STT",
+            voice=DummyVoice(file_id="voice-err", file_size=1024),
+        )
+        fd, raw_path = tempfile.mkstemp(prefix="voice-handler-error-", suffix=".ogg")
+        os.close(fd)
+        audio_path = Path(raw_path)
+        audio_path.write_bytes(b"fake audio")
+
+        async def fake_download_voice_message(message_arg, bot_arg) -> Path:
+            return audio_path
+
+        class BrokenSTT:
+            def transcribe(self, audio_path_arg: Path) -> str:
+                raise STTConfigurationError("STT key is missing")
+
+        with patch.object(bot_start, "SessionLocal", new=lambda: session):
+            with patch.object(bot_start, "_download_voice_message", new=fake_download_voice_message):
+                with patch.object(bot_start, "STTService", new=lambda: BrokenSTT()):
+                    await bot_start.voice_message_handler(message, object())
+
+        self.assertFalse(audio_path.exists())
+        self.assertEqual(len(message.answers), 2)
+        self.assertIn("Не удалось распознать", message.answers[1]["text"])
+        self.assertIn("STT key is missing", message.answers[1]["text"])
+
+
+    async def test_text_message_is_answered_by_assistant(self) -> None:
+        session, _engine = self.make_session()
+        message = DummyMessage(
+            text="эти новости не про google",
+            user_id=9203,
+            username="textuser",
+            full_name="Text User",
+        )
+        captured: dict[str, object] = {}
+
+        class FakeQAService:
+            def __init__(self, session_arg) -> None:
+                captured["session"] = session_arg
+
+            def answer(self, user_id: int, question: str, window_days: int):
+                captured["qa_args"] = (user_id, question, window_days)
+                return QAResponse(
+                    question=question,
+                    window_days=window_days,
+                    answer_text="Недостаточно данных по google.",
+                    sources=[],
+                    used_fallback=True,
+                    weak_evidence=True,
+                )
+
+        with patch.object(bot_start, "SessionLocal", new=lambda: session):
+            with patch.object(bot_start, "QAService", new=FakeQAService):
+                await bot_start.assistant_text_message_handler(message)
+
+        self.assertEqual(captured["qa_args"][1], "эти новости не про google")
+        self.assertEqual(captured["qa_args"][2], DEFAULT_DIGEST_WINDOW_DAYS)
+        self.assertEqual(len(message.answers), 1)
+        self.assertIn("эти новости не про google", message.answers[0]["text"])
+        self.assertIn("Недостаточно данных по google.", message.answers[0]["text"])
+
+    async def test_reserved_text_messages_are_not_answered_by_assistant(self) -> None:
+        session, _engine = self.make_session()
+
+        class RaisingQAService:
+            def __init__(self, session_arg) -> None:
+                pass
+
+            def answer(self, user_id: int, question: str, window_days: int):
+                raise AssertionError("Reserved bot commands must not hit QAService")
+
+        for text in ("Help", "Digest", "Add channel", "/digest"):
+            with self.subTest(text=text):
+                message = DummyMessage(text=text)
+                with patch.object(bot_start, "SessionLocal", new=lambda: session):
+                    with patch.object(bot_start, "QAService", new=RaisingQAService):
+                        await bot_start.assistant_text_message_handler(message)
+                self.assertEqual(message.answers, [])
 
 
 class BotUXTests(SessionTestMixin, unittest.TestCase):
@@ -1201,6 +1475,129 @@ class AssistantServiceTests(SessionTestMixin, unittest.TestCase):
         self.assertGreaterEqual(len(response.sources), 1)
         self.assertIn("[1]", response.answer_text)
         self.assertIn("OpenAI Feed", response.answer_text)
+
+    def test_anchor_query_does_not_return_unrelated_brand_posts(self) -> None:
+        session, _engine = self.make_session()
+        user = UserService(session).upsert_telegram_user(
+            telegram_user_id=805,
+            username="googlefilter",
+            display_name="Google Filter",
+        )
+        channel = self.create_user_added_channel(session, user.id, "aifeed", "AI Feed", enabled=True)
+
+        now = datetime.now(timezone.utc)
+        session.add_all(
+            [
+                Post(
+                    channel_id=channel.id,
+                    telegram_message_id=1301,
+                    raw_text="Kimi ships a new coding model",
+                    cleaned_text="Kimi released a new code preview model for SWE-Bench tasks.",
+                    source_url="https://t.me/aifeed/1301",
+                    published_at=now - timedelta(hours=2),
+                ),
+                Post(
+                    channel_id=channel.id,
+                    telegram_message_id=1302,
+                    raw_text="Claude pricing update",
+                    cleaned_text="Anthropic updated Claude pricing and subscription tiers.",
+                    source_url="https://t.me/aifeed/1302",
+                    published_at=now - timedelta(hours=1),
+                ),
+                Post(
+                    channel_id=channel.id,
+                    telegram_message_id=1303,
+                    raw_text="Yandex practical AI release",
+                    cleaned_text="Yandex launched a practical AI release for developers.",
+                    source_url="https://t.me/aifeed/1303",
+                    published_at=now - timedelta(hours=3),
+                ),
+            ]
+        )
+        session.commit()
+
+        response = QAService(session, llm=DummyLLM()).answer(
+            user_id=user.id,
+            question="Расскажи про новые продукты Google за неделю",
+            window_days=7,
+        )
+
+        self.assertTrue(response.used_fallback)
+        self.assertTrue(response.weak_evidence)
+        self.assertEqual(response.sources, [])
+        self.assertNotIn("Kimi", response.answer_text)
+        self.assertNotIn("Claude", response.answer_text)
+        self.assertNotIn("Yandex", response.answer_text)
+
+    def test_anchor_query_returns_google_text_and_digest_hint_sources(self) -> None:
+        session, _engine = self.make_session()
+        user = UserService(session).upsert_telegram_user(
+            telegram_user_id=806,
+            username="googlehint",
+            display_name="Google Hint",
+        )
+        channel = self.create_user_added_channel(session, user.id, "productfeed", "Product Feed", enabled=True)
+
+        now = datetime.now(timezone.utc)
+        google_text_post = Post(
+            channel_id=channel.id,
+            telegram_message_id=1401,
+            raw_text="Google product launch",
+            cleaned_text="Google showed a new developer product for agents and file validation this week.",
+            source_url="https://t.me/productfeed/1401",
+            published_at=now - timedelta(hours=2),
+        )
+        digest_hint_post = Post(
+            channel_id=channel.id,
+            telegram_message_id=1402,
+            raw_text="Developer tooling update",
+            cleaned_text="A developer tooling update shipped with design document validation.",
+            source_url="https://t.me/productfeed/1402",
+            published_at=now - timedelta(hours=1),
+        )
+        unrelated_post = Post(
+            channel_id=channel.id,
+            telegram_message_id=1403,
+            raw_text="Kimi product launch",
+            cleaned_text="Kimi released a new code model for SWE-Bench tasks.",
+            source_url="https://t.me/productfeed/1403",
+            published_at=now - timedelta(minutes=30),
+        )
+        session.add_all([google_text_post, digest_hint_post, unrelated_post])
+        session.flush()
+        digest = Digest(
+            user_id=user.id,
+            status="ready",
+            delivery_status="sent",
+            body_text="Digest with Google tooling note",
+            source_post_count=2,
+        )
+        session.add(digest)
+        session.flush()
+        session.add(
+            DigestItem(
+                digest_id=digest.id,
+                post_id=digest_hint_post.id,
+                channel_title=channel.title,
+                title="Google developer tooling",
+                summary="Google showed a product update for agent workflows.",
+                source_url=digest_hint_post.source_url,
+                score=1.0,
+                published_at=digest_hint_post.published_at,
+            )
+        )
+        session.commit()
+
+        response = QAService(session, llm=DummyLLM()).answer(
+            user_id=user.id,
+            question="Расскажи подробнее про продукты Google",
+            window_days=7,
+        )
+        source_urls = {source.source_url for source in response.sources}
+
+        self.assertIn("https://t.me/productfeed/1401", source_urls)
+        self.assertIn("https://t.me/productfeed/1402", source_urls)
+        self.assertNotIn("https://t.me/productfeed/1403", source_urls)
 
 
 class WebSurfaceTests(SessionTestMixin, unittest.TestCase):
