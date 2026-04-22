@@ -2,6 +2,70 @@
 
 ---
 
+## [2026-04-22 14:40] Telegram assistant follow-ups and anchored RAG filtering
+### Current state
+- Telegram bot now answers ordinary text questions as assistant queries, not only voice messages.
+- Voice and text assistant answers share the same bot-side QA helper and response formatting.
+- RAG retrieval now treats known brand/entity tokens such as `google`, `openai`, `claude`, `anthropic`, `kimi`, and `mcp` as anchor terms.
+- When a query has anchor terms, unrelated posts without the anchor are filtered out instead of being returned due to generic words like "new", "product", or "model".
+
+### Decisions made
+- Kept retrieval SQLite/lexical and did not add embeddings or new tables.
+- Treated text messages as fresh assistant questions, not stateful corrections to the previous answer.
+- Left existing commands, reply-keyboard buttons, and add-channel state handling ahead of the generic text assistant handler.
+
+### Problems / blockers
+- Retrieval is still lexical, so semantic matches without the explicit brand/entity token can be missed.
+- The generic text assistant does not store chat history yet.
+
+### Files changed
+- `app/bot/handlers/start.py`
+- `app/rag/retriever.py`
+- `app/rag/qa.py`
+- `tests/test_mvp_slice.py`
+- `docs/Evolution.md`
+
+### Next step
+- If real usage still shows weak matches, add embeddings or a lightweight reranker behind the existing retriever interface.
+
+### Prompt handoff
+Telegram assistant follow-ups now work for normal text messages, and RAG retrieval has anchor filtering for explicit brand/entity queries. Preserve the current modular monolith and SQLite-first retriever; the clean next extension point is still `SQLiteRAGRetriever`, not a bot flow rewrite.
+
+---
+
+## [2026-04-22 00:00] Telegram voice input for RAG assistant
+### Current state
+- Telegram bot now accepts voice messages as assistant questions.
+- The bot downloads the Telegram voice file, transcribes it through a configurable Whisper-compatible STT API, and sends the transcript into the existing `QAService`.
+- Voice answers reuse the same stored-post context and citation source format as the current RAG assistant instead of adding a new chat subsystem.
+- If STT is not configured or transcription fails, the bot returns a user-facing error and does not crash the update.
+
+### Decisions made
+- Kept the slice bot-side and transient: no new DB tables for audio inputs or transcript history yet.
+- Reused existing user identity, digest window preference, and RAG retrieval boundaries.
+- Added provider configuration through `.env` (`STT_API_KEY`, `STT_API_BASE_URL`, `STT_MODEL`, `STT_LANGUAGE`) without changing the LLM/Together path.
+
+### Problems / blockers
+- Real STT quality and latency depend on the external Whisper-compatible provider configured in deployment.
+- Telegram voice processing is covered with mocked tests locally; full end-to-end verification still needs a live bot token and network access.
+
+### Files changed
+- `app/config.py`
+- `app/services/stt.py`
+- `app/bot/handlers/start.py`
+- `.env.example`
+- `README.md`
+- `tests/test_mvp_slice.py`
+- `docs/Evolution.md`
+
+### Next step
+- Verify on a live Telegram bot with a real STT provider key, then decide whether transcript persistence is needed for analytics/history.
+
+### Prompt handoff
+Voice input is now wired into the Telegram-first MVP as a narrow flow: Telegram voice -> temporary audio download -> `STTService` -> `QAService.answer()` -> Telegram reply with transcript, answer, and sources. The next agent should not add audio/transcript tables unless explicitly requested; first validate provider settings and real bot behavior.
+
+---
+
 ## [2026-04-17 15:00] Bot add-channel crash fix
 ### Current state
 - Telegram bot add-channel flow now accepts both `@username` and `https://t.me/username` inputs without crashing.

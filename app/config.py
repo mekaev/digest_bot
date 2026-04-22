@@ -32,6 +32,15 @@ class Settings(BaseSettings):
         alias="TOGETHER_MODEL",
     )
 
+    # Speech-to-text
+    stt_api_key: str = Field(default="", alias="STT_API_KEY")
+    stt_api_base_url: str = Field(
+        default="https://api.together.ai/v1",
+        alias="STT_API_BASE_URL",
+    )
+    stt_model: str = Field(default="openai/whisper-large-v3", alias="STT_MODEL")
+    stt_language: str = Field(default="ru", alias="STT_LANGUAGE")
+
     # API
     api_host: str = Field(default="127.0.0.1", alias="API_HOST")
     api_port: int = Field(default=8000, alias="API_PORT")
